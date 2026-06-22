@@ -1,0 +1,7 @@
+# build artifacts
+ds5_txd
+ds5_aclre
+ds5_aclinject
+*.o
+*.ipk
+build/
