@@ -1,0 +1,10 @@
+#!/bin/sh
+# webosbrew boot hook (run-parts /var/lib/webosbrew/init.d): start the DS5 raw-ACL
+# template publisher as a detached daemon. Lets the jailed Aurora app inject 0x36
+# controller-audio reports in-process via raw HCI ACL, bypassing webOS BT
+# one-outstanding flow control (the on-air metering that caused audio dropouts).
+# Fire-and-forget: a hung/crashing boot hook would trip webosbrew failsafe.
+# Filename has NO dot on purpose (busybox run-parts skips names with dots).
+# --exec must be the unique wrapper path, NOT /bin/sh (which would false-positive
+# the already-running check against every shell).
+start-stop-daemon --start --background --exec /var/lib/webosbrew/ds5-tmpld.sh
