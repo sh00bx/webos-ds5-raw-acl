@@ -156,6 +156,26 @@ static struct htab_ent g_htab[4096];   /* indexed by handle & 0x0fff */
 static uint16_t g_handle = 0;          /* handle the live template is bound to */
 static uint8_t  g_bound_addr[6];       /* device identity captured with the template */
 static int      g_bound_known = 0;     /* g_bound_addr is valid (capture-time gate) */
+static int      g_rawfd = -1;          /* main's raw HCI socket, shared for link-policy writes */
+
+/* Disable sniff/hold/park on the DS5 ACL link (keep role-switch). Measured live
+ * 2026-07-02: the stack lets the link fall into SNIFF (interval 124 slots =
+ * 77.5 ms) every ~30 s; input collapses to ~13 Hz for ~0.5 s until the app's
+ * 500 ms stopSniff poll recovers it — the user-visible input dropouts. Clearing
+ * the sniff policy bit makes the LMP layer reject sniff requests from EITHER
+ * side, so the mode never changes. Per-packet write on a SOCK_RAW datagram
+ * socket is atomic, so racing with main's ACL injects is safe. */
+#define OP_WRITE_LINK_POLICY 0x080d
+#define LINK_POLICY_ACTIVE   0x0001    /* role switch only; sniff/hold/park off */
+static void send_link_policy(uint16_t handle){
+    if(g_rawfd<0) return;
+    uint8_t cmd[8]={ 0x01 /*HCI_COMMAND_PKT*/,
+        OP_WRITE_LINK_POLICY&0xff, OP_WRITE_LINK_POLICY>>8, 4,
+        (uint8_t)(handle&0xff), (uint8_t)((handle>>8)&0x0f),
+        LINK_POLICY_ACTIVE&0xff, LINK_POLICY_ACTIVE>>8 };
+    if(write(g_rawfd,cmd,sizeof cmd)!=(ssize_t)sizeof cmd)
+        fprintf(stderr,"[txd] link-policy write failed: %s\n",strerror(errno));
+}
 
 /* Publish the 16-byte readiness/template record atomically (temp+rename). */
 static void publish(uint8_t flags, uint16_t nonce, const uint8_t hdr[8]){
@@ -460,17 +480,21 @@ static void *capture_thread(void *arg){
     if(bind(mfd,(struct sockaddr*)&ma,sizeof ma)<0){ perror("[txd] bind monitor"); close(mfd); return NULL; }
     struct timeval tv={.tv_sec=0,.tv_usec=300000}; setsockopt(mfd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
     uint8_t buf[2048];
-    uint64_t last_learn=0;
+    uint64_t last_learn=0, last_policy=0;
     for(;;){
         /* Idle backstop: evaluated EVERY wakeup (not only on recv-timeout) so it
          * still fires while other BT devices keep the monitor socket busy. After a
          * flap the DS5 stops emitting HID-output -> g_last_seen ages out -> template
          * invalidated within IDLE_INVALIDATE_MS even if the DISCONN event was lost. */
-        int idle_inval=0;
+        int idle_inval=0; int reassert_handle=-1;
         pthread_mutex_lock(&g_lock);
         if(g_have && now_ms()-g_last_seen>IDLE_INVALIDATE_MS){ g_have=0; idle_inval=1; }
+        if(g_have && now_ms()-last_policy>5000){ last_policy=now_ms(); reassert_handle=g_handle; }
         pthread_mutex_unlock(&g_lock);
         if(idle_inval){ publish_current(); fprintf(stderr,"[txd] link idle -> template INVALID\n"); }
+        /* Re-assert the no-sniff link policy every 5 s while bound: the LG stack can
+         * rewrite the policy on its own events, and the command is a no-op on air. */
+        if(reassert_handle>=0) send_link_policy((uint16_t)reassert_handle);
 
         int r=(int)recv(mfd,buf,sizeof buf,0);
         if(r<0){
@@ -518,7 +542,8 @@ static void *capture_thread(void *arg){
         pthread_mutex_unlock(&g_lock);
         if(did_capture){
             publish_current();
-            fprintf(stderr,"[txd] template handle=0x%03x CID=0x%04x nonce=%u bound\n",hh,cid,nonce);
+            send_link_policy(hh);   /* pin the link ACTIVE the moment we bind it */
+            fprintf(stderr,"[txd] template handle=0x%03x CID=0x%04x nonce=%u bound (sniff off)\n",hh,cid,nonce);
         }
         if(need_learn){
             /* Throttled refresh of the handle->bdaddr table for the case where the
@@ -554,6 +579,7 @@ int main(int argc,char**argv){
     ra.hci_family=AF_BLUETOOTH; ra.hci_dev=TARGET_HCI_INDEX; ra.hci_channel=HCI_CHANNEL_RAW;
     if(bind(rawfd,(struct sockaddr*)&ra,sizeof ra)<0){ perror("[txd] bind raw"); return 1; }
     int fl=fcntl(rawfd,F_GETFL,0); if(fl>=0) fcntl(rawfd,F_SETFL,fl|O_NONBLOCK);
+    g_rawfd=rawfd;   /* published before the capture thread starts (policy writes) */
 
     /* AF_UNIX datagram socket the jailed app sends reports to (non-blocking, 1MB
      * recv buffer, SO_PASSCRED — see bind_unix_dgram). Self-healed across remounts. */
