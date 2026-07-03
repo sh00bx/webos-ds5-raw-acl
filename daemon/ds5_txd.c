@@ -48,7 +48,8 @@
 //         a second adapter's handle reuse can't pollute the table.
 //   Plus hardening the two IPC surfaces the audit named: the report datagram socket
 //   now requires SO_PEERCRED == jail uid, and the hid-fd broker only ever hands out
-//   the DS5's own hidraw (VID:PID 054C:0CE6), never another device's node.
+//   an allowlisted game pad's hidraw (PAD_ALLOW; DS5, DS4, Xbox, Switch Pro,
+//   8BitDo), never a system HID device's node.
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdint.h>
@@ -96,8 +97,8 @@
 #define IDLE_INVALIDATE_MS  1500   /* drop the template after this much DS5 silence */
 #define DRAIN_CAP           1024   /* max reports drained per poll wakeup (anti-flood) */
 #define JAIL_UID            6261   /* aurora jail uid — only sender allowed to inject */
-#define DS5_VID             0x054c /* Sony      } broker only hands out the DS5's own */
-#define DS5_PID             0x0ce6 /* DualSense } hidraw (054C:0CE6), never a foreign node */
+#define DS5_VID             0x054c /* Sony      } primary device; the broker additionally */
+#define DS5_PID             0x0ce6 /* DualSense } allows a small game-pad list, see PAD_ALLOW */
 
 struct sockaddr_hci { unsigned short hci_family, hci_dev, hci_channel; };
 struct hci_mon_hdr  { uint16_t opcode, index, len; } __attribute__((packed));
@@ -294,13 +295,34 @@ static int valid_hidraw_path(const char *p){
     return 1;
 }
 
-/* True iff the open hidraw fd is the DS5 itself (VID:PID 054C:0CE6). Closes the
- * audit's "second contamination route": the broker must never hand the app (or any
- * local process) RW access to the Magic Remote's — or any non-DS5 — hidraw node. */
-static int is_ds5_hidraw(int fd){
+/* Broker allowlist: game controllers whose hidraw node may be handed into the
+ * jail. Closes the audit's "second contamination route" — the broker must never
+ * hand the app (or any local process) RW access to the Magic Remote's, a
+ * keyboard's, or any other system HID node. Kept as an explicit VID/PID list
+ * (pid 0 = whole vendor) rather than "anything that looks like a pad": every
+ * entry here is reachable RW from the jail. */
+static const struct { uint16_t vid, pid; } PAD_ALLOW[] = {
+    {DS5_VID, DS5_PID}, /* Sony DualSense */
+    {0x054c,  0x0df2},  /* Sony DualSense Edge */
+    {0x054c,  0x05c4},  /* Sony DualShock 4 v1 */
+    {0x054c,  0x09cc},  /* Sony DualShock 4 v2 */
+    {0x054c,  0x0ba0},  /* Sony DS4 USB wireless dongle */
+    {0x045e,  0x02e0},  /* Xbox One S pad (BT) */
+    {0x045e,  0x02fd},  /* Xbox One S pad (BT, fw 3.x) */
+    {0x045e,  0x0b05},  /* Xbox Elite Series 2 (BT) */
+    {0x045e,  0x0b13},  /* Xbox Series X|S pad (BT) */
+    {0x045e,  0x0b20},  /* Xbox One S pad (BLE fw 5.x) */
+    {0x045e,  0x0b22},  /* Xbox Elite Series 2 (BLE fw 5.x) */
+    {0x057e,  0x2009},  /* Nintendo Switch Pro Controller */
+    {0x2dc8,  0x0000},  /* 8BitDo (controllers only as a vendor) */
+};
+static int is_allowed_pad_hidraw(int fd){
     struct hidraw_devinfo info;
     if(ioctl(fd,HIDIOCGRAWINFO,&info)<0) return 0;
-    return (uint16_t)info.vendor==DS5_VID && (uint16_t)info.product==DS5_PID;
+    uint16_t v=(uint16_t)info.vendor, p=(uint16_t)info.product;
+    for(size_t i=0;i<sizeof PAD_ALLOW/sizeof PAD_ALLOW[0];++i)
+        if(PAD_ALLOW[i].vid==v && (PAD_ALLOW[i].pid==p || PAD_ALLOW[i].pid==0)) return 1;
+    return 0;
 }
 
 /* True iff a connected peer's uid is allowed to drive us (jail app or root). */
@@ -379,8 +401,8 @@ static void *broker_thread(void *arg){
         if(valid_hidraw_path(req)){
             hfd=open(req,O_RDWR|O_CLOEXEC);
             if(hfd<0) hfd=open(req,O_RDONLY|O_CLOEXEC);
-            if(hfd>=0 && !is_ds5_hidraw(hfd)){   /* only the DS5's own node leaves the broker */
-                fprintf(stderr,"[txd] broker refused non-DS5 hidraw %s\n",req);
+            if(hfd>=0 && !is_allowed_pad_hidraw(hfd)){   /* only allowlisted pads leave the broker */
+                fprintf(stderr,"[txd] broker refused non-allowlisted hidraw %s\n",req);
                 close(hfd); hfd=-1;
             }
         }
