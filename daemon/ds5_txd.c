@@ -595,6 +595,13 @@ static void *capture_thread(void *arg){
         uint16_t hh=(uint16_t)((d[0]|(d[1]<<8))&0x0fff);
         int did_capture=0, need_learn=0; unsigned cid=0; uint16_t nonce=0;
         pthread_mutex_lock(&g_lock);
+        /* Single inject slot: once bound, HID-output on any OTHER handle is a
+         * FOREIGN pad (reachable since the multi-pad broker — e.g. a second
+         * DualSense seeding via hidraw, or other tooling driving DS5#2). Ignore
+         * it entirely: never flip-flop the template per report, and never let
+         * foreign traffic refresh g_last_seen (the idle backstop must track the
+         * BOUND pad only). Rebind happens only after invalidation clears g_have. */
+        if(g_have && hh!=g_handle){ pthread_mutex_unlock(&g_lock); continue; }
         g_last_seen=now_ms();
         /* Only handle (d[0..1]) + CID (d[6..7]) are connection-constant; lengths
          * (d[2..5]) vary per report id and are recomputed at inject. */
