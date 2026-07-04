@@ -15,6 +15,7 @@
 SOCK=/var/palm/jail/com.aurora.gamestream/tmp/ds5_acl.sock
 TMPL=/var/palm/jail/com.aurora.gamestream/tmp/ds5_acl_tmpl
 HIDFD=/var/palm/jail/com.aurora.gamestream/tmp/ds5_hidfd.sock
+LOG=/tmp/ds5_txd.log
 PIDFILE=/tmp/ds5-tmpld.pid
 
 # Singleton guard. The boot hook's start-stop-daemon --exec check can NEVER dedup
@@ -65,7 +66,12 @@ reassert_workers() {
 }
 
 while true; do
-  /var/lib/webosbrew/ds5_txd "$SOCK" "$TMPL" "$HIDFD" >/tmp/ds5_txd.log 2>&1 &
+  # Rotate (never truncate) at spawn so a crashed instance's log survives one
+  # respawn generation — the old O_TRUNC redirect wiped the crash evidence ~1s
+  # after every death. Open in APPEND mode: the in-loop 1MB cap truncates the
+  # live file, and only an O_APPEND fd follows that truncation back to offset 0.
+  [ -f "$LOG" ] && mv -f "$LOG" "$LOG.1"
+  /var/lib/webosbrew/ds5_txd "$SOCK" "$TMPL" "$HIDFD" >>"$LOG" 2>&1 &
   TXD=$!
   # wait for bind + thread creation, then take ds5_txd off real-time priority
   i=0
@@ -88,7 +94,7 @@ while true; do
     kill -0 "$TXD" 2>/dev/null || break
     [ $n -lt 5 ] && sleep 1
   done
-  echo "$(date +%H:%M:%S) [tmpld] ds5_txd $TXD -> SCHED_OTHER (main nice -5, workers nice 19, ${n}x)" >>/tmp/ds5_txd.log
+  echo "$(date +%H:%M:%S) [tmpld] ds5_txd $TXD -> SCHED_OTHER (main nice -5, workers nice 19, ${n}x)" >>"$LOG"
   # Supervise. ds5_txd now self-heals the jail-tmp remount IN-PROCESS (mountinfo
   # poll -> rebind ds5_acl.sock + re-publish, in microseconds). A momentarily-gone
   # socket node is therefore NORMAL and must NOT trigger a restart: the old
@@ -101,13 +107,18 @@ while true; do
     if [ ! -S "$SOCK" ]; then
       gone=$((gone+1))
       if [ $gone -ge 6 ]; then   # 6 consecutive misses ~= 10s of 2s ticks
-        echo "$(date +%H:%M:%S) [tmpld] ds5_acl.sock gone >10s (in-process self-heal stuck) -> restarting ds5_txd" >>/tmp/ds5_txd.log
+        echo "$(date +%H:%M:%S) [tmpld] ds5_acl.sock gone >10s (in-process self-heal stuck) -> restarting ds5_txd" >>"$LOG"
         kill "$TXD" 2>/dev/null
         break
       fi
     else
       gone=0
     fi
+    # Size guard: bound the live log within one long-lived run (the 10s stats line
+    # accumulates over gaming hours). Truncate in place — the daemon holds an
+    # O_APPEND fd, so its next write resumes at offset 0 (no lost/dangling fd).
+    sz=$(wc -c <"$LOG" 2>/dev/null || echo 0)
+    [ "$sz" -gt 1048576 ] && : >"$LOG"
     sleep 2
   done
   wait "$TXD" 2>/dev/null
