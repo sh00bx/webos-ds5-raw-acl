@@ -721,6 +721,10 @@ int main(int argc,char**argv){
                 if(!injectable(rep[0])){ dropped++; continue; }/* only DS5 output reports (0x31/0x32/0x36) */
 
                 int ok=0, need_inval=0, over=0; const char *reason=NULL;
+                /* Read the tunable BEFORE taking g_lock: inject_maxq() refreshes its
+                 * cache from /tmp ~1/s, and g_lock must never be held across
+                 * filesystem I/O (see the invariant above g_lock). Per-report constant. */
+                int maxq=inject_maxq();
                 pthread_mutex_lock(&g_lock);
                 if(g_have){
                     /* Re-check the live handle->bdaddr mapping and inject under the
@@ -729,7 +733,7 @@ int main(int argc,char**argv){
                     uint16_t hh=(uint16_t)((g_hdr[0]|(g_hdr[1]<<8))&0x0fff);
                     if(g_htab[hh].known && memcmp(g_htab[hh].addr,g_bound_addr,6)!=0){
                         g_have=0; need_inval=1; reason="bound handle now foreign -> template INVALID";
-                    } else if(g_outstanding>=inject_maxq() &&
+                    } else if(g_outstanding>=maxq &&
                               !(g_last_nocp && now_ms()-g_last_nocp>STALL_RESET_MS)){
                         /* Credit window full: the controller hasn't confirmed our queued TX,
                          * so the link is busy (input/video wants airtime). Drop this output
@@ -737,7 +741,7 @@ int main(int argc,char**argv){
                          * Only happens under contention -> no static bandwidth sacrifice. */
                         over=1;
                     } else {
-                        if(g_outstanding>=inject_maxq()) g_outstanding=0; /* stall backstop: credits stopped -> resync */
+                        if(g_outstanding>=maxq) g_outstanding=0; /* stall backstop: credits stopped -> resync */
                         uint16_t l2=(uint16_t)(1+n), acl=(uint16_t)(4+l2);
                         frame[0]=HCI_ACLDATA_PKT; memcpy(frame+1,g_hdr,8);
                         frame[3]=(uint8_t)(acl&0xff); frame[4]=(uint8_t)(acl>>8);
