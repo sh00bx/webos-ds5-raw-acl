@@ -84,7 +84,9 @@
 /* HCI event codes we parse off the MONITOR stream to track handle<->device. */
 #define HCI_EV_CONN_COMPLETE    0x03
 #define HCI_EV_DISCONN_COMPLETE 0x05
+#define HCI_EV_NUM_COMP_PKTS    0x13
 #define HCI_EV_LE_META          0x3e
+#define STALL_RESET_MS          150   /* credits stopped this long -> resync g_outstanding */
 #define HCI_SUBEV_LE_CONN       0x01   /* LE Connection Complete                 */
 #define HCI_SUBEV_LE_ENH_CONN   0x0a   /* Enhanced LE Connection Complete (BT5)  */
 
@@ -122,6 +124,32 @@ struct hci_conn_list_req { uint16_t dev_id, conn_num; struct hci_conn_info ci[16
 
 static int injectable(uint8_t id){ return id==0x31 || id==0x32 || id==0x36; }
 static uint64_t now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return (uint64_t)ts.tv_sec*1000ull+ts.tv_nsec/1000000ull; }
+static uint64_t now_us(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return (uint64_t)ts.tv_sec*1000000ull+ts.tv_nsec/1000ull; }
+
+/* Max outstanding raw-ACL TX packets (a credit window). The inject path bypasses the
+ * webOS BT one-outstanding metering: keeping it at 1 was the original jitter wall,
+ * but removing the bound ENTIRELY lets our output backlog the controller's TX queue,
+ * so the baseband spends its slots draining TX and polls the DS5 less -> its INPUT
+ * reports gap (controller lag while the video/WiFi stays smooth). A small credit
+ * window is the fix: pipeline enough packets to keep haptics tight, but never so many
+ * that TX starves the input poll. It is INHERENTLY ADAPTIVE and prioritises input
+ * without a static rate cap -- when the link is idle the controller confirms our
+ * packets fast (NOCP), credits free immediately and we inject at full haptic rate;
+ * only under contention (input/video needing airtime) do the credits lag, and output
+ * automatically backs off to whatever bandwidth is left. Live-tunable via
+ * /tmp/ds5_inject_maxq (>=1; a large value approximates the original unmetered path).
+ * Cached ~1/sec. */
+#define INJECT_MAXQ_DEFAULT 3
+static int inject_maxq(void){
+    static int q=INJECT_MAXQ_DEFAULT; static uint64_t last=0;
+    uint64_t n=now_us();
+    if(last==0 || n-last>1000000ull){
+        last=n;
+        FILE *f=fopen("/tmp/ds5_inject_maxq","r");
+        if(f){ int v=0; if(fscanf(f,"%d",&v)==1 && v>=1 && v<=1000) q=v; fclose(f); }
+    }
+    return q;
+}
 
 /* g_lock guards the shared template/identity state below. It is held only for
  * short, NON-BLOCKING work — never across filesystem I/O. Publishing the template
@@ -134,6 +162,10 @@ static uint8_t  g_hdr[8];
 static int      g_have = 0;
 static uint16_t g_nonce = 0;
 static uint64_t g_last_seen = 0;
+static int      g_outstanding = 0;   /* our raw-ACL TX packets queued in the controller but not yet
+                                        confirmed on-air (via HCI Number_Of_Completed_Packets). Bounded
+                                        by inject_maxq() so the baseband keeps polling the DS5 for INPUT. */
+static uint64_t g_last_nocp  = 0;    /* last NOCP time; stall backstop if credits stop returning */
 static const char *g_tmpl_path;
 
 /* ---- handle<->device identity binding (anti cross-contamination) ----------- *
@@ -449,6 +481,23 @@ static void handle_hci_event(const uint8_t *e, int el){
         memcpy(g_htab[hh].addr,p+6,6); g_htab[hh].known=1;
         if(g_have && hh==g_handle && memcmp(p+6,g_bound_addr,6)!=0){ g_have=0; reason="bound handle reassigned (LE)"; }
         pthread_mutex_unlock(&g_lock);
+    } else if(code==HCI_EV_NUM_COMP_PKTS && pl>=1){        /* TX credits returned: free the outstanding window */
+        int nh=p[0];
+        if(pl < 1+nh*4) return;
+        pthread_mutex_lock(&g_lock);
+        if(g_have){
+            uint16_t bh=(uint16_t)((g_hdr[0]|(g_hdr[1]<<8))&0x0fff);
+            for(int i=0;i<nh;i++){
+                uint16_t hh=(uint16_t)((p[1+i*4]|(p[2+i*4]<<8))&0x0fff);
+                if(hh==bh){
+                    int cnt=(int)(p[3+i*4]|(p[4+i*4]<<8));
+                    g_outstanding-=cnt; if(g_outstanding<0) g_outstanding=0;
+                }
+            }
+        }
+        g_last_nocp=now_ms();
+        pthread_mutex_unlock(&g_lock);
+        return;   /* NOCP never affects template validity */
     } else return;
     if(reason){ publish_current(); fprintf(stderr,"[txd] %s -> template INVALID\n",reason); }
 }
@@ -617,7 +666,8 @@ int main(int argc,char**argv){
      * rebind is pending or the mount watch is unavailable (degrade to polling). */
     int minfo=open_mount_watch();   /* self-heal ds5_acl.sock across jail-tmp remounts */
     uint8_t rep[ACL_MAX_REPORT], frame[1+8+1+ACL_MAX_REPORT];
-    long injected=0, dropped=0; uint64_t last_log=now_ms();
+    long injected=0, dropped=0, paced=0; uint64_t last_log=now_ms();
+    g_last_nocp=now_ms();   /* seed the stall backstop so output can't wedge before the first NOCP */
     for(;;){
         struct pollfd pfd[2]={{ufd,POLLIN,0},{minfo,POLLPRI,0}};
         int to=(ufd<0 || minfo<0)?500:-1;
@@ -656,7 +706,7 @@ int main(int argc,char**argv){
                 if(!cred_ok(&mh)){ dropped++; continue; }      /* peer-cred gate: jail uid only */
                 if(!injectable(rep[0])){ dropped++; continue; }/* only DS5 output reports (0x31/0x32/0x36) */
 
-                int ok=0, need_inval=0; const char *reason=NULL;
+                int ok=0, need_inval=0, over=0; const char *reason=NULL;
                 pthread_mutex_lock(&g_lock);
                 if(g_have){
                     /* Re-check the live handle->bdaddr mapping and inject under the
@@ -665,25 +715,33 @@ int main(int argc,char**argv){
                     uint16_t hh=(uint16_t)((g_hdr[0]|(g_hdr[1]<<8))&0x0fff);
                     if(g_htab[hh].known && memcmp(g_htab[hh].addr,g_bound_addr,6)!=0){
                         g_have=0; need_inval=1; reason="bound handle now foreign -> template INVALID";
+                    } else if(g_outstanding>=inject_maxq() &&
+                              !(g_last_nocp && now_ms()-g_last_nocp>STALL_RESET_MS)){
+                        /* Credit window full: the controller hasn't confirmed our queued TX,
+                         * so the link is busy (input/video wants airtime). Drop this output
+                         * report (real-time, latest wins) instead of deepening the backlog.
+                         * Only happens under contention -> no static bandwidth sacrifice. */
+                        over=1;
                     } else {
+                        if(g_outstanding>=inject_maxq()) g_outstanding=0; /* stall backstop: credits stopped -> resync */
                         uint16_t l2=(uint16_t)(1+n), acl=(uint16_t)(4+l2);
                         frame[0]=HCI_ACLDATA_PKT; memcpy(frame+1,g_hdr,8);
                         frame[3]=(uint8_t)(acl&0xff); frame[4]=(uint8_t)(acl>>8);
                         frame[5]=(uint8_t)(l2&0xff);  frame[6]=(uint8_t)(l2>>8);
                         frame[9]=0xA2; memcpy(frame+10,rep,n);
                         ssize_t wr=write(rawfd,frame,10+n);
-                        if(wr==(ssize_t)(10+n)) ok=1;
+                        if(wr==(ssize_t)(10+n)){ ok=1; g_outstanding++; }
                         else if(wr<0 && errno==EBADF){   /* stale handle (reconnect): force reseed */
                             g_have=0; need_inval=1; reason="inject EBADF -> template INVALID (reconnect)";
                         }
                     }
                 }
                 pthread_mutex_unlock(&g_lock);
-                if(ok) injected++; else dropped++;
+                if(ok) injected++; else if(over) paced++; else dropped++;
                 if(need_inval){ publish_current(); fprintf(stderr,"[txd] %s\n",reason); }
             }
         }
-        if(now_ms()-last_log>10000){ fprintf(stderr,"[txd] inj=%ld drop=%ld\n",injected,dropped); last_log=now_ms(); }
+        if(now_ms()-last_log>10000){ fprintf(stderr,"[txd] inj=%ld drop=%ld backoff=%ld q=%d/%d\n",injected,dropped,paced,g_outstanding,inject_maxq()); last_log=now_ms(); }
     }
     return 0;
 }
