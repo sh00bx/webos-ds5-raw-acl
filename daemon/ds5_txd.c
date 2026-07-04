@@ -138,8 +138,16 @@ static uint64_t now_us(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,
  * only under contention (input/video needing airtime) do the credits lag, and output
  * automatically backs off to whatever bandwidth is left. Live-tunable via
  * /tmp/ds5_inject_maxq (>=1; a large value approximates the original unmetered path).
- * Cached ~1/sec. */
-#define INJECT_MAXQ_DEFAULT 3
+ * Cached ~1/sec.
+ *
+ * Default 12 (measured 2026-07-04 in-game): the DS5 speaker/haptics 0x36 audio
+ * stream is ~94 frames/s, and a window of 3 filled constantly under contention
+ * -> the drop-newest path fired ~180x/10s = audible audio/haptic dropouts. A
+ * gap sweep (3/8/12/16) vs DS5 input-report rate showed input is BT-connection-
+ * -interval bound (~22ms floor) and barely moves with the window: 3->16 cost
+ * only ~5% input rate (496->469 reports/10s) while cutting audio drops ~97%
+ * (180->5). 12 is the balance: drops ~14/10s, input 482/10s (~3% under floor). */
+#define INJECT_MAXQ_DEFAULT 12
 static int inject_maxq(void){
     static int q=INJECT_MAXQ_DEFAULT; static uint64_t last=0;
     uint64_t n=now_us();
