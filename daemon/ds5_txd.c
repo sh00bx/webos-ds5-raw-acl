@@ -284,6 +284,28 @@ static void send_link_policy(uint16_t handle){
         fprintf(stderr,"[txd] link-policy write failed: %s\n",strerror(errno));
 }
 
+/* BR/EDR scan control (Write_Scan_Enable). Measured live 2026-07-05: the
+ * controller's periodic page/inquiry scan blocks the DS5 ACL link for
+ * 86-234ms on a ~1.28s grid (EPISODE detector) — audible speaker dropouts and
+ * the input hiccups. Scan-off while a template is bound removed ~8x of the
+ * blackouts and made input clean in the live A/B. Scan mode 2 (connectable,
+ * not discoverable) is restored whenever the template goes invalid so devices
+ * can (re)connect outside sessions. Re-asserted with the 5s link-policy tick:
+ * the LG stack re-enables scans on its own. */
+#define OP_WRITE_SCAN_ENABLE 0x0c1a
+static void send_scan_enable(uint8_t mode){
+    static uint8_t last_sent=0xff;
+    if(g_rawfd<0) return;
+    uint8_t cmd[5]={ 0x01,
+        OP_WRITE_SCAN_ENABLE&0xff, OP_WRITE_SCAN_ENABLE>>8, 1, mode };
+    if(write(g_rawfd,cmd,sizeof cmd)!=(ssize_t)sizeof cmd)
+        fprintf(stderr,"[txd] scan-enable write failed: %s\n",strerror(errno));
+    else if(mode!=last_sent){
+        fprintf(stderr,"[txd] scan_enable=%u (%s)\n",mode,mode?"restored":"off for session");
+        last_sent=mode;
+    }
+}
+
 /* Publish the 16-byte readiness/template record atomically (temp+rename). */
 static void publish(uint8_t flags, uint16_t nonce, const uint8_t hdr[8]){
     uint8_t rec[16];
@@ -571,13 +593,25 @@ static void handle_hci_event(const uint8_t *e, int el){
                      * (Magic Remote etc.) suppress the 150ms backstop exactly when
                      * our credits are the ones wedged. */
                     g_last_nocp=now_ms();
+                    /* NOCP for the bound handle also proves the LINK is alive:
+                     * the controller is completing OUR injections. Without this,
+                     * g_last_seen is only refreshed by kernel-path HID writes
+                     * (the tmpld seeder) -- if that write blocks >1.5s on the
+                     * one-outstanding flow control under full raw-inject load,
+                     * the idle backstop misfires mid-stream and the resulting
+                     * template-invalidate/rebind cycle stalls injection (an
+                     * audible speaker dropout). A real flap stops producing
+                     * NOCPs for this handle, and handle-reassignment is caught
+                     * by the CONN/DISCONN handlers, so the backstop's purpose
+                     * is preserved. */
+                    g_last_seen=now_ms();
                 }
             }
         }
         pthread_mutex_unlock(&g_lock);
         return;   /* NOCP never affects template validity */
     } else return;
-    if(reason){ publish_current(); fprintf(stderr,"[txd] %s -> template INVALID\n",reason); }
+    if(reason){ publish_current(); fprintf(stderr,"[txd] %s -> template INVALID\n",reason); send_scan_enable(2); }
 }
 
 /* Best-effort: seed/refresh the handle->bdaddr table from the kernel's current
@@ -629,21 +663,28 @@ static void *capture_thread(void *arg){
     if(bind(mfd,(struct sockaddr*)&ma,sizeof ma)<0){ perror("[txd] bind monitor"); close(mfd); return NULL; }
     struct timeval tv={.tv_sec=0,.tv_usec=300000}; setsockopt(mfd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
     uint8_t buf[2048];
-    uint64_t last_learn=0, last_policy=0;
+    uint64_t last_learn=0, last_policy=0, last_scan=0;
     for(;;){
         /* Idle backstop: evaluated EVERY wakeup (not only on recv-timeout) so it
          * still fires while other BT devices keep the monitor socket busy. After a
          * flap the DS5 stops emitting HID-output -> g_last_seen ages out -> template
          * invalidated within IDLE_INVALIDATE_MS even if the DISCONN event was lost. */
-        int idle_inval=0; int reassert_handle=-1;
+        int idle_inval=0; int reassert_handle=-1; int reassert_scan=0;
         pthread_mutex_lock(&g_lock);
         if(g_have && now_ms()-g_last_seen>IDLE_INVALIDATE_MS){ g_have=0; idle_inval=1; }
         if(g_have && now_ms()-last_policy>5000){ last_policy=now_ms(); reassert_handle=g_handle; }
+        if(g_have && now_ms()-last_scan>1000){ last_scan=now_ms(); reassert_scan=1; }
         pthread_mutex_unlock(&g_lock);
-        if(idle_inval){ publish_current(); fprintf(stderr,"[txd] link idle -> template INVALID\n"); }
+        if(idle_inval){ publish_current(); fprintf(stderr,"[txd] link idle -> template INVALID\n"); send_scan_enable(2); }
         /* Re-assert the no-sniff link policy every 5 s while bound: the LG stack can
          * rewrite the policy on its own events, and the command is a no-op on air. */
         if(reassert_handle>=0) send_link_policy((uint16_t)reassert_handle);
+        /* Re-assert scan-off every 1 s while bound: measured 2026-07-05, the LG
+         * stack re-enables page/inquiry scan within seconds of our write; at a
+         * 5 s cadence the sneaked-in scans still blacked out the link 88-120ms
+         * every ~4-5s (audible dropouts even at a 56ms DS5 buffer). At 1 Hz the
+         * live A/B measured 3 episodes/2min vs ~25 before. */
+        if(reassert_scan) send_scan_enable(0);
 
         int r=(int)recv(mfd,buf,sizeof buf,0);
         if(r<0){
@@ -702,7 +743,8 @@ static void *capture_thread(void *arg){
         if(did_capture){
             publish_current();
             send_link_policy(hh);   /* pin the link ACTIVE the moment we bind it */
-            fprintf(stderr,"[txd] template handle=0x%03x CID=0x%04x nonce=%u bound (sniff off)\n",hh,cid,nonce);
+            send_scan_enable(0);    /* session radio hygiene: no page/inquiry scan blackouts */
+            fprintf(stderr,"[txd] template handle=0x%03x CID=0x%04x nonce=%u bound (sniff off, noscan)\n",hh,cid,nonce);
         }
         if(need_learn){
             /* Throttled refresh of the handle->bdaddr table for the case where the
@@ -781,6 +823,23 @@ int main(int argc,char**argv){
 
         /* Drain reports queued on the (non-blocking) report socket, bounded per
          * wakeup so a flood can't monopolize the loop or starve the mount watch. */
+        /* Radio-episode detector: outstanding credits with no NOCP for >80ms
+         * means the controller is not getting airtime (WiFi-scan blackout,
+         * interference burst) -- the invisible cause of "late but not lost"
+         * audio/input. Timestamped so felt dropouts can be correlated. */
+        {
+            static uint64_t ep_start=0;
+            uint64_t nowm=now_ms();
+            pthread_mutex_lock(&g_lock);
+            int qd=g_outstanding; uint64_t ln=g_last_nocp; int hv=g_have;
+            pthread_mutex_unlock(&g_lock);
+            if(hv && qd>0 && ln && nowm-ln>80){
+                if(!ep_start){ ep_start=nowm; fprintf(stderr,"[txd] EPISODE start t=%llu q=%d\n",(unsigned long long)nowm,qd); }
+            } else if(ep_start){
+                fprintf(stderr,"[txd] EPISODE end t=%llu dur=%dms\n",(unsigned long long)nowm,(int)(nowm-ep_start));
+                ep_start=0;
+            }
+        }
         if(ufd>=0 && (pfd[0].revents&POLLIN)){
             for(int drained=0; drained<DRAIN_CAP; drained++){
                 struct iovec iov={.iov_base=rep,.iov_len=sizeof rep};
@@ -816,8 +875,17 @@ int main(int argc,char**argv){
                 }
                 if(need_inval){ publish_current(); fprintf(stderr,"[txd] %s\n",reason); need_inval=0; reason=NULL; }
 
-                /* The freshly-arrived report. */
-                int r=inject_one(rawfd,rep,(int)n,maxq,&reason);
+                /* The freshly-arrived report. Type-aware window: rumble
+                 * (0x31/0x32) may only fill HALF the credit window, audio
+                 * (0x36) the whole one. During a heavy rumble burst (game
+                 * updates every frame) rumble otherwise stuffs the controller
+                 * queue to the cap and every audio frame transits BEHIND up to
+                 * maxq rumble packets (~50-100ms late at the DS5 -> speaker
+                 * buffer underrun, the dash-time dropout). Capping rumble
+                 * keeps audio transit bounded; excess rumble stays latest-wins
+                 * dropped, which it already was at the full window. */
+                int cap=(rep[0]==0x36)?maxq:((maxq/2)>0?(maxq/2):1);
+                int r=inject_one(rawfd,rep,(int)n,cap,&reason);
                 if(r==1){ injected++; }
                 else if(r==-1){ need_inval=1; }
                 else if(r==0){
