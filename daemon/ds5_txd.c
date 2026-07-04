@@ -492,10 +492,14 @@ static void handle_hci_event(const uint8_t *e, int el){
                 if(hh==bh){
                     int cnt=(int)(p[3+i*4]|(p[4+i*4]<<8));
                     g_outstanding-=cnt; if(g_outstanding<0) g_outstanding=0;
+                    /* Refresh the stall timestamp ONLY for OUR handle's completions:
+                     * a global refresh would let any other device's NOCP chatter
+                     * (Magic Remote etc.) suppress the 150ms backstop exactly when
+                     * our credits are the ones wedged. */
+                    g_last_nocp=now_ms();
                 }
             }
         }
-        g_last_nocp=now_ms();
         pthread_mutex_unlock(&g_lock);
         return;   /* NOCP never affects template validity */
     } else return;
@@ -603,6 +607,9 @@ static void *capture_thread(void *arg){
                  * handle to a different bdaddr is a contamination event we reject. */
                 memcpy(g_hdr,d,8); g_handle=hh; memcpy(g_bound_addr,g_htab[hh].addr,6);
                 g_bound_known=1; g_have=1; g_nonce++;
+                g_outstanding=0; g_last_nocp=now_ms();   /* fresh link = fresh credit window:
+                     never inherit phantom credits from a flapped connection whose
+                     NOCPs were lost (they can never be drained once g_have dropped) */
                 did_capture=1; cid=(unsigned)(d[6]|(d[7]<<8)); nonce=g_nonce;
             } else {
                 /* Fail CLOSED: bdaddr unknown -> do NOT publish valid. The app keeps
