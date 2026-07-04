@@ -5,6 +5,9 @@
 # one-outstanding flow control (the on-air metering that caused audio dropouts).
 # Fire-and-forget: a hung/crashing boot hook would trip webosbrew failsafe.
 # Filename has NO dot on purpose (busybox run-parts skips names with dots).
-# --exec must be the unique wrapper path, NOT /bin/sh (which would false-positive
-# the already-running check against every shell).
+# NOTE: busybox start-stop-daemon's --exec already-running check can NOT match a
+# shell script (it compares /proc/<pid>/exe, which for a script is the interpreter
+# /bin/sh, never the script path) — the REAL duplicate-start guard is the pidfile
+# check inside ds5-tmpld.sh itself. --background is kept only to detach the
+# supervisor so this hook returns immediately.
 start-stop-daemon --start --background --exec /var/lib/webosbrew/ds5-tmpld.sh

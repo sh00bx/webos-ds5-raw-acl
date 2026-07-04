@@ -15,6 +15,22 @@
 SOCK=/var/palm/jail/com.aurora.gamestream/tmp/ds5_acl.sock
 TMPL=/var/palm/jail/com.aurora.gamestream/tmp/ds5_acl_tmpl
 HIDFD=/var/palm/jail/com.aurora.gamestream/tmp/ds5_hidfd.sock
+PIDFILE=/tmp/ds5-tmpld.pid
+
+# Singleton guard. The boot hook's start-stop-daemon --exec check can NEVER dedup
+# a shell script (busybox matches --exec against /proc/<pid>/exe, which for a
+# running script is the INTERPRETER /bin/sh -> busybox, never the script path), so
+# a hook re-run (manual start, hbchannel restart, webosbrew re-elevation) would
+# spawn a second supervisor + ds5_txd, and the pair would unlink-steal the
+# rendezvous sockets from each other on every remount. Guard here instead:
+# pidfile + liveness + cmdline check (a recycled pid of some other process, or a
+# stale file from a crash, is treated as stale and taken over).
+OLD=$(cat "$PIDFILE" 2>/dev/null)
+if [ -n "$OLD" ] && [ "$OLD" != "$$" ] && kill -0 "$OLD" 2>/dev/null \
+   && grep -q ds5-tmpld "/proc/$OLD/cmdline" 2>/dev/null; then
+  exit 0   # a live supervisor already owns the pidfile
+fi
+echo $$ >"$PIDFILE"
 
 # Take ds5_txd off real-time AND split priorities so neither thread hurts the
 # CTM usbip input thread, while keeping haptic tight:
