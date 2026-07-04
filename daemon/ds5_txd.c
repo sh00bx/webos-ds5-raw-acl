@@ -159,6 +159,31 @@ static int inject_maxq(void){
     return q;
 }
 
+/* Elastic FIFO for 0x36 speaker/haptics audio (OPT-IN, default 0 = disabled =
+ * legacy drop-newest behavior). When the credit window is transiently full
+ * (BT airtime lost to input/video), the drop-newest path punches a ~10ms hole
+ * in the audio -> audible "Aussetzer". With a FIFO of depth N>0, a full-window
+ * audio frame is instead HELD and injected as soon as a credit frees (drained
+ * on the next report arrival, ~10ms grid), converting a transient drop into a
+ * few-ms delay. The window (inject_maxq) still bounds the controller's TX queue,
+ * so input polling is unaffected -- the FIFO holds frames in OUR memory, not in
+ * the controller. Sustained congestion overflows the FIFO -> drop-oldest, so
+ * latency is bounded by N frames (~10.7ms each). Live-tunable via
+ * /tmp/ds5_inject_fifo (0..FIFO_MAX). Cached ~1/sec. */
+#define FIFO_MAX             16
+#define FIFO_ENTRY_MAX       256   /* audio 0x36 reports are well under this */
+#define INJECT_FIFO_DEFAULT  0
+static int inject_fifo(void){
+    static int d=INJECT_FIFO_DEFAULT; static uint64_t last=0;
+    uint64_t n=now_us();
+    if(last==0 || n-last>1000000ull){
+        last=n;
+        FILE *f=fopen("/tmp/ds5_inject_fifo","r");
+        if(f){ int v=-1; if(fscanf(f,"%d",&v)==1 && v>=0 && v<=FIFO_MAX) d=v; fclose(f); }
+    }
+    return d;
+}
+
 /* g_lock guards the shared template/identity state below. It is held only for
  * short, NON-BLOCKING work — never across filesystem I/O. Publishing the template
  * record (which does open/write/rename and can block on the jail mount) is done by
@@ -197,6 +222,47 @@ static struct htab_ent g_htab[4096];   /* indexed by handle & 0x0fff */
 static uint16_t g_handle = 0;          /* handle the live template is bound to */
 static uint8_t  g_bound_addr[6];       /* device identity captured with the template */
 static int      g_bound_known = 0;     /* g_bound_addr is valid (capture-time gate) */
+
+/* Inject one output report as a raw-ACL frame under g_lock, honoring the credit
+ * window. Critical section identical in scope to the legacy inline path (one
+ * bounded, non-blocking write; TOCTOU handle re-check under the same lock).
+ * Returns:  1 = injected (g_outstanding++),
+ *           0 = credit window full (caller may queue or drop),
+ *          -1 = template invalidated (foreign handle / EBADF; *reason set, caller
+ *               must publish_current() + log),
+ *          -2 = no live template (g_have==0). */
+static int inject_one(int rawfd, const uint8_t *rep, int n, int maxq, const char **reason){
+    uint8_t frame[1+8+1+ACL_MAX_REPORT];
+    int r=-2;
+    pthread_mutex_lock(&g_lock);
+    if(g_have){
+        uint16_t hh=(uint16_t)((g_hdr[0]|(g_hdr[1]<<8))&0x0fff);
+        if(g_htab[hh].known && memcmp(g_htab[hh].addr,g_bound_addr,6)!=0){
+            g_have=0; *reason="bound handle now foreign -> template INVALID"; r=-1;
+        } else if(g_outstanding>=maxq &&
+                  !(g_last_nocp && now_ms()-g_last_nocp>STALL_RESET_MS)){
+            r=0;
+        } else {
+            if(g_outstanding>=maxq) g_outstanding=0; /* stall backstop: credits stopped -> resync */
+            uint16_t l2=(uint16_t)(1+n), acl=(uint16_t)(4+l2);
+            frame[0]=HCI_ACLDATA_PKT; memcpy(frame+1,g_hdr,8);
+            frame[3]=(uint8_t)(acl&0xff); frame[4]=(uint8_t)(acl>>8);
+            frame[5]=(uint8_t)(l2&0xff);  frame[6]=(uint8_t)(l2>>8);
+            frame[9]=0xA2; memcpy(frame+10,rep,n);
+            ssize_t wr=write(rawfd,frame,10+n);
+            if(wr==(ssize_t)(10+n)){ r=1; g_outstanding++; }
+            else if(wr<0 && errno==EBADF){ g_have=0; *reason="inject EBADF -> template INVALID (reconnect)"; r=-1; }
+            else r=0;
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+    return r;
+}
+
+/* Audio-only elastic FIFO (single-threaded: touched only by the main poll loop). */
+static struct { uint8_t buf[FIFO_ENTRY_MAX]; int len; } g_fifo[FIFO_MAX];
+static int g_fifo_head=0, g_fifo_count=0;
+static void fifo_clear(void){ g_fifo_head=0; g_fifo_count=0; }
 static int      g_rawfd = -1;          /* main's raw HCI socket, shared for link-policy writes */
 
 /* Disable sniff/hold/park on the DS5 ACL link (keep role-switch). Measured live
@@ -687,7 +753,7 @@ int main(int argc,char**argv){
      * at once. Pure poll(-1) in steady state; a 500ms tick engages only while a
      * rebind is pending or the mount watch is unavailable (degrade to polling). */
     int minfo=open_mount_watch();   /* self-heal ds5_acl.sock across jail-tmp remounts */
-    uint8_t rep[ACL_MAX_REPORT], frame[1+8+1+ACL_MAX_REPORT];
+    uint8_t rep[ACL_MAX_REPORT];   /* inject framing now lives in inject_one() */
     long injected=0, dropped=0, paced=0; uint64_t last_log=now_ms();
     g_last_nocp=now_ms();   /* seed the stall backstop so output can't wedge before the first NOCP */
     for(;;){
@@ -728,46 +794,52 @@ int main(int argc,char**argv){
                 if(!cred_ok(&mh)){ dropped++; continue; }      /* peer-cred gate: jail uid only */
                 if(!injectable(rep[0])){ dropped++; continue; }/* only DS5 output reports (0x31/0x32/0x36) */
 
-                int ok=0, need_inval=0, over=0; const char *reason=NULL;
-                /* Read the tunable BEFORE taking g_lock: inject_maxq() refreshes its
-                 * cache from /tmp ~1/s, and g_lock must never be held across
-                 * filesystem I/O (see the invariant above g_lock). Per-report constant. */
+                int need_inval=0; const char *reason=NULL;
+                /* Read the tunables BEFORE taking g_lock: they fopen /tmp ~1/s and
+                 * g_lock must never wrap filesystem I/O (see the invariant above
+                 * g_lock). Per-report constants. inject_one() takes/releases g_lock
+                 * itself per frame, keeping each critical section as short as the
+                 * legacy inline path. */
                 int maxq=inject_maxq();
-                pthread_mutex_lock(&g_lock);
-                if(g_have){
-                    /* Re-check the live handle->bdaddr mapping and inject under the
-                     * SAME lock so a reassignment can't slip into a check->write gap
-                     * (TOCTOU). g_have implies g_bound_known, so g_bound_addr is valid. */
-                    uint16_t hh=(uint16_t)((g_hdr[0]|(g_hdr[1]<<8))&0x0fff);
-                    if(g_htab[hh].known && memcmp(g_htab[hh].addr,g_bound_addr,6)!=0){
-                        g_have=0; need_inval=1; reason="bound handle now foreign -> template INVALID";
-                    } else if(g_outstanding>=maxq &&
-                              !(g_last_nocp && now_ms()-g_last_nocp>STALL_RESET_MS)){
-                        /* Credit window full: the controller hasn't confirmed our queued TX,
-                         * so the link is busy (input/video wants airtime). Drop this output
-                         * report (real-time, latest wins) instead of deepening the backlog.
-                         * Only happens under contention -> no static bandwidth sacrifice. */
-                        over=1;
+                int fdepth=inject_fifo();
+
+                /* Drain FIFO backlog first (audio held from an earlier credit stall),
+                 * oldest-first, while credits allow. Runs even when fdepth==0 so
+                 * disabling the FIFO flushes a residual backlog instead of stranding
+                 * it. */
+                while(g_fifo_count>0){
+                    int idx=g_fifo_head;
+                    int r=inject_one(rawfd,g_fifo[idx].buf,g_fifo[idx].len,maxq,&reason);
+                    if(r==1){ g_fifo_head=(g_fifo_head+1)%FIFO_MAX; g_fifo_count--; injected++; continue; }
+                    if(r==-1){ need_inval=1; fifo_clear(); }  /* template gone -> drop stale audio */
+                    break;                                    /* credits full (0) or no template (-2) */
+                }
+                if(need_inval){ publish_current(); fprintf(stderr,"[txd] %s\n",reason); need_inval=0; reason=NULL; }
+
+                /* The freshly-arrived report. */
+                int r=inject_one(rawfd,rep,(int)n,maxq,&reason);
+                if(r==1){ injected++; }
+                else if(r==-1){ need_inval=1; }
+                else if(r==0){
+                    /* Credit window full (link busy: input/video wants airtime).
+                     * Audio (0x36) with the FIFO enabled -> HOLD it (few-ms delay,
+                     * drained above on the next arrival) rather than punch a ~10ms
+                     * hole. Rumble (0x31/0x32) and FIFO-off stay latest-wins: a stale
+                     * rumble is wrong, so drop. FIFO overflow -> drop OLDEST so total
+                     * added latency stays bounded by fdepth frames. */
+                    if(rep[0]==0x36 && fdepth>0 && (int)n<=FIFO_ENTRY_MAX){
+                        if(g_fifo_count>=fdepth){ g_fifo_head=(g_fifo_head+1)%FIFO_MAX; g_fifo_count--; dropped++; }
+                        int tail=(g_fifo_head+g_fifo_count)%FIFO_MAX;
+                        memcpy(g_fifo[tail].buf,rep,(size_t)n); g_fifo[tail].len=(int)n; g_fifo_count++;
                     } else {
-                        if(g_outstanding>=maxq) g_outstanding=0; /* stall backstop: credits stopped -> resync */
-                        uint16_t l2=(uint16_t)(1+n), acl=(uint16_t)(4+l2);
-                        frame[0]=HCI_ACLDATA_PKT; memcpy(frame+1,g_hdr,8);
-                        frame[3]=(uint8_t)(acl&0xff); frame[4]=(uint8_t)(acl>>8);
-                        frame[5]=(uint8_t)(l2&0xff);  frame[6]=(uint8_t)(l2>>8);
-                        frame[9]=0xA2; memcpy(frame+10,rep,n);
-                        ssize_t wr=write(rawfd,frame,10+n);
-                        if(wr==(ssize_t)(10+n)){ ok=1; g_outstanding++; }
-                        else if(wr<0 && errno==EBADF){   /* stale handle (reconnect): force reseed */
-                            g_have=0; need_inval=1; reason="inject EBADF -> template INVALID (reconnect)";
-                        }
+                        paced++;   /* legacy latest-wins drop */
                     }
                 }
-                pthread_mutex_unlock(&g_lock);
-                if(ok) injected++; else if(over) paced++; else dropped++;
+                else { dropped++; }   /* r==-2: no live template */
                 if(need_inval){ publish_current(); fprintf(stderr,"[txd] %s\n",reason); }
             }
         }
-        if(now_ms()-last_log>10000){ fprintf(stderr,"[txd] inj=%ld drop=%ld backoff=%ld q=%d/%d\n",injected,dropped,paced,g_outstanding,inject_maxq()); last_log=now_ms(); }
+        if(now_ms()-last_log>10000){ fprintf(stderr,"[txd] inj=%ld drop=%ld backoff=%ld q=%d/%d fifo=%d/%d\n",injected,dropped,paced,g_outstanding,inject_maxq(),g_fifo_count,inject_fifo()); last_log=now_ms(); }
     }
     return 0;
 }
