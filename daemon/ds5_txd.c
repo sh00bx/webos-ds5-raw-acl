@@ -201,6 +201,36 @@ static int      g_outstanding = 0;   /* our raw-ACL TX packets queued in the con
                                         confirmed on-air (via HCI Number_Of_Completed_Packets). Bounded
                                         by inject_maxq() so the baseband keeps polling the DS5 for INPUT. */
 static uint64_t g_last_nocp  = 0;    /* last NOCP time; stall backstop if credits stop returning */
+
+/* In-flight TX type ring (guarded by g_lock, same lifetime as g_outstanding).
+ * NOCP credits do not say WHICH packet completed, so per-type accounting
+ * approximates FIFO: injects push their type, each returned credit pops the
+ * oldest. The rumble count this yields (g_rumble_fly) is what lets the credit
+ * window be type-aware — rumble bounded by its OWN occupancy instead of the
+ * total (a window full of audio must never read as "rumble is over budget").
+ * The approximation errs OPEN under foreign kernel-path TX on the same handle
+ * (their NOCPs pop our entries early -> g_rumble_fly under-counts -> rumble
+ * slightly more permissive), which is the safe direction: it can relax the
+ * rumble cap a little, never starve it. */
+#define TXRING 64
+static uint8_t g_txtype[TXRING];     /* 1 = rumble (0x31/0x32), 0 = audio (0x36) */
+static int g_tx_head=0, g_tx_cnt=0;
+static int g_rumble_fly=0;           /* believed-in-flight rumble packets */
+static void txwin_reset(void){ g_tx_head=0; g_tx_cnt=0; g_rumble_fly=0; }
+static void txwin_push(int rumble){
+    if(g_tx_cnt==TXRING){             /* overflow (huge tuned maxq): age out oldest */
+        if(g_txtype[g_tx_head]) g_rumble_fly--;
+        g_tx_head=(g_tx_head+1)%TXRING; g_tx_cnt--;
+    }
+    g_txtype[(g_tx_head+g_tx_cnt)%TXRING]=(uint8_t)(rumble?1:0);
+    g_tx_cnt++; if(rumble) g_rumble_fly++;
+}
+static void txwin_pop(int cnt){
+    while(cnt-->0 && g_tx_cnt>0){
+        if(g_txtype[g_tx_head]) g_rumble_fly--;
+        g_tx_head=(g_tx_head+1)%TXRING; g_tx_cnt--;
+    }
+}
 static const char *g_tmpl_path;
 
 /* ---- handle<->device identity binding (anti cross-contamination) ----------- *
@@ -228,6 +258,30 @@ static int      g_bound_known = 0;     /* g_bound_addr is valid (capture-time ga
 /* Inject one output report as a raw-ACL frame under g_lock, honoring the credit
  * window. Critical section identical in scope to the legacy inline path (one
  * bounded, non-blocking write; TOCTOU handle re-check under the same lock).
+ *
+ * The window is TYPE-AWARE, derived from rep[0]:
+ *   audio (0x36):        may fill maxq-1 credits. The last credit is RESERVED so
+ *                        a fresh rumble frame always finds room the moment none
+ *                        of its own are in flight — without the reserve, the
+ *                        ~94/s audio stream keeps the window pinned at full
+ *                        under contention and a rumble state change (e.g. the
+ *                        OFF after a burst) is dropped for as long as the
+ *                        contention lasts: the pad keeps buzzing with the last
+ *                        applied intensity.
+ *   rumble (0x31/0x32):  bounded by the full window AND by its OWN in-flight
+ *                        count (g_rumble_fly) at maxq/2 — counting rumble by
+ *                        its own occupancy, not the total, is what makes the
+ *                        "rumble may only fill half the window" contract real.
+ *
+ * Stall backstop: window full with no NOCP for STALL_RESET_MS means the credits
+ * are presumed lost (a flap ate the NOCPs) -> resync to empty AND RE-ARM
+ * g_last_nocp. Without the re-arm a long radio blackout (NOCPs delayed, not
+ * lost) keeps the stall condition true, so the window would reset every time it
+ * refills (~130ms at audio rate) — i.e. unbounded injection into the controller
+ * TX queue for the whole blackout, exactly the input-poll starvation the window
+ * exists to prevent. Audio-only: a rumble call operates at half occupancy and
+ * must never zero the shared accounting.
+ *
  * Returns:  1 = injected (g_outstanding++),
  *           0 = credit window full (caller may queue or drop),
  *          -1 = template invalidated (foreign handle / EBADF; *reason set, caller
@@ -236,25 +290,33 @@ static int      g_bound_known = 0;     /* g_bound_addr is valid (capture-time ga
 static int inject_one(int rawfd, const uint8_t *rep, int n, int maxq, const char **reason){
     uint8_t frame[1+8+1+ACL_MAX_REPORT];
     int r=-2;
+    int is_rumble=(rep[0]!=0x36);
+    int lim  = is_rumble ? maxq : (maxq>1 ? maxq-1 : 1);   /* audio leaves 1 credit reserved */
+    int rcap = (maxq/2)>0 ? (maxq/2) : 1;
     pthread_mutex_lock(&g_lock);
     if(g_have){
         uint16_t hh=(uint16_t)((g_hdr[0]|(g_hdr[1]<<8))&0x0fff);
         if(g_htab[hh].known && memcmp(g_htab[hh].addr,g_bound_addr,6)!=0){
             g_have=0; *reason="bound handle now foreign -> template INVALID"; r=-1;
-        } else if(g_outstanding>=maxq &&
-                  !(g_last_nocp && now_ms()-g_last_nocp>STALL_RESET_MS)){
-            r=0;
         } else {
-            if(g_outstanding>=maxq) g_outstanding=0; /* stall backstop: credits stopped -> resync */
-            uint16_t l2=(uint16_t)(1+n), acl=(uint16_t)(4+l2);
-            frame[0]=HCI_ACLDATA_PKT; memcpy(frame+1,g_hdr,8);
-            frame[3]=(uint8_t)(acl&0xff); frame[4]=(uint8_t)(acl>>8);
-            frame[5]=(uint8_t)(l2&0xff);  frame[6]=(uint8_t)(l2>>8);
-            frame[9]=0xA2; memcpy(frame+10,rep,n);
-            ssize_t wr=write(rawfd,frame,10+n);
-            if(wr==(ssize_t)(10+n)){ r=1; g_outstanding++; }
-            else if(wr<0 && errno==EBADF){ g_have=0; *reason="inject EBADF -> template INVALID (reconnect)"; r=-1; }
-            else r=0;
+            if(!is_rumble && g_outstanding>=lim &&
+               g_last_nocp && now_ms()-g_last_nocp>STALL_RESET_MS){
+                g_outstanding=0; txwin_reset();   /* credits presumed lost -> resync */
+                g_last_nocp=now_ms();             /* re-arm: at most one resync per STALL_RESET_MS */
+            }
+            if(g_outstanding>=lim || (is_rumble && g_rumble_fly>=rcap)){
+                r=0;
+            } else {
+                uint16_t l2=(uint16_t)(1+n), acl=(uint16_t)(4+l2);
+                frame[0]=HCI_ACLDATA_PKT; memcpy(frame+1,g_hdr,8);
+                frame[3]=(uint8_t)(acl&0xff); frame[4]=(uint8_t)(acl>>8);
+                frame[5]=(uint8_t)(l2&0xff);  frame[6]=(uint8_t)(l2>>8);
+                frame[9]=0xA2; memcpy(frame+10,rep,n);
+                ssize_t wr=write(rawfd,frame,10+n);
+                if(wr==(ssize_t)(10+n)){ r=1; g_outstanding++; txwin_push(is_rumble); }
+                else if(wr<0 && errno==EBADF){ g_have=0; *reason="inject EBADF -> template INVALID (reconnect)"; r=-1; }
+                else r=0;
+            }
         }
     }
     pthread_mutex_unlock(&g_lock);
@@ -265,6 +327,23 @@ static int inject_one(int rawfd, const uint8_t *rep, int n, int maxq, const char
 static struct { uint8_t buf[FIFO_ENTRY_MAX]; int len; } g_fifo[FIFO_MAX];
 static int g_fifo_head=0, g_fifo_count=0;
 static void fifo_clear(void){ g_fifo_head=0; g_fifo_count=0; }
+
+/* Drain the audio backlog oldest-first while credits allow (main thread only).
+ * Runs even when the FIFO tunable is 0 so disabling it flushes a residual
+ * backlog instead of stranding it. Returns the number injected; on template
+ * invalidation sets need_inval + reason (caller publishes) and drops the stale
+ * backlog. */
+static long drain_fifo(int rawfd, int maxq, int *need_inval, const char **reason){
+    long inj=0;
+    while(g_fifo_count>0){
+        int idx=g_fifo_head;
+        int r=inject_one(rawfd,g_fifo[idx].buf,g_fifo[idx].len,maxq,reason);
+        if(r==1){ g_fifo_head=(g_fifo_head+1)%FIFO_MAX; g_fifo_count--; inj++; continue; }
+        if(r==-1){ *need_inval=1; fifo_clear(); }  /* template gone -> drop stale audio */
+        break;                                     /* credits full (0) or no template (-2) */
+    }
+    return inj;
+}
 static int      g_rawfd = -1;          /* main's raw HCI socket, shared for link-policy writes */
 
 /* HCI command health guard + rate discipline (2026-07-05, corrected same
@@ -631,6 +710,7 @@ static void handle_hci_event(const uint8_t *e, int el){
                 if(hh==bh){
                     int cnt=(int)(p[3+i*4]|(p[4+i*4]<<8));
                     g_outstanding-=cnt; if(g_outstanding<0) g_outstanding=0;
+                    txwin_pop(cnt);   /* FIFO-approximate the per-type in-flight counts */
                     /* Refresh the stall timestamp ONLY for OUR handle's completions:
                      * a global refresh would let any other device's NOCP chatter
                      * (Magic Remote etc.) suppress the 150ms backstop exactly when
@@ -792,9 +872,10 @@ static void *capture_thread(void *arg){
                  * handle to a different bdaddr is a contamination event we reject. */
                 memcpy(g_hdr,d,8); g_handle=hh; memcpy(g_bound_addr,g_htab[hh].addr,6);
                 g_bound_known=1; g_have=1; g_nonce++;
-                g_outstanding=0; g_last_nocp=now_ms();   /* fresh link = fresh credit window:
-                     never inherit phantom credits from a flapped connection whose
-                     NOCPs were lost (they can never be drained once g_have dropped) */
+                g_outstanding=0; g_last_nocp=now_ms(); txwin_reset();   /* fresh link =
+                     fresh credit window: never inherit phantom credits (or per-type
+                     counts) from a flapped connection whose NOCPs were lost (they
+                     can never be drained once g_have dropped) */
                 did_capture=1; cid=(unsigned)(d[6]|(d[7]<<8)); nonce=g_nonce;
             } else {
                 /* Fail CLOSED: bdaddr unknown -> do NOT publish valid. The app keeps
@@ -850,6 +931,12 @@ int main(int argc,char**argv){
     int ufd=bind_unix_dgram(sock_path);
     if(ufd<0){ perror("[txd] bind unix"); return 1; }
 
+    /* Seed the stall backstop BEFORE the worker threads exist: g_last_nocp is a
+     * 64-bit field guarded by g_lock, and an unlocked store after thread creation
+     * could tear against a capture-thread writer on 32-bit ARM. Pre-thread, plain
+     * store is fine and output still can't wedge before the first NOCP. */
+    g_last_nocp=now_ms();
+
     pthread_t cap; pthread_create(&cap,NULL,capture_thread,NULL);
     pthread_t brk; pthread_create(&brk,NULL,broker_thread,(void*)hidfd_path);
     fprintf(stderr,"[txd] forwarder up (cmdguard): unix=%s tmpl=%s hidfd=%s\n",sock_path,g_tmpl_path,hidfd_path);
@@ -860,7 +947,6 @@ int main(int argc,char**argv){
     int minfo=open_mount_watch();   /* self-heal ds5_acl.sock across jail-tmp remounts */
     uint8_t rep[ACL_MAX_REPORT];   /* inject framing now lives in inject_one() */
     long injected=0, dropped=0, paced=0; uint64_t last_log=now_ms();
-    g_last_nocp=now_ms();   /* seed the stall backstop so output can't wedge before the first NOCP */
     for(;;){
         struct pollfd pfd[2]={{ufd,POLLIN,0},{minfo,POLLPRI,0}};
         int to=(ufd<0 || minfo<0)?500:-1;
@@ -937,53 +1023,53 @@ int main(int argc,char**argv){
                  * legacy inline path. */
                 int maxq=inject_maxq();
                 int fdepth=inject_fifo();
+                int r;
 
-                /* Drain FIFO backlog first (audio held from an earlier credit stall),
-                 * oldest-first, while credits allow. Runs even when fdepth==0 so
-                 * disabling the FIFO flushes a residual backlog instead of stranding
-                 * it. */
-                while(g_fifo_count>0){
-                    int idx=g_fifo_head;
-                    int r=inject_one(rawfd,g_fifo[idx].buf,g_fifo[idx].len,maxq,&reason);
-                    if(r==1){ g_fifo_head=(g_fifo_head+1)%FIFO_MAX; g_fifo_count--; injected++; continue; }
-                    if(r==-1){ need_inval=1; fifo_clear(); }  /* template gone -> drop stale audio */
-                    break;                                    /* credits full (0) or no template (-2) */
-                }
-                if(need_inval){ publish_current(); fprintf(stderr,"[txd] %s\n",reason); need_inval=0; reason=NULL; }
-
-                /* The freshly-arrived report. Type-aware window: rumble
-                 * (0x31/0x32) may only fill HALF the credit window, audio
-                 * (0x36) the whole one. During a heavy rumble burst (game
-                 * updates every frame) rumble otherwise stuffs the controller
-                 * queue to the cap and every audio frame transits BEHIND up to
-                 * maxq rumble packets (~50-100ms late at the DS5 -> speaker
-                 * buffer underrun, the dash-time dropout). Capping rumble
-                 * keeps audio transit bounded; excess rumble stays latest-wins
-                 * dropped, which it already was at the full window. */
-                int cap=(rep[0]==0x36)?maxq:((maxq/2)>0?(maxq/2):1);
-                int r=inject_one(rawfd,rep,(int)n,cap,&reason);
-                if(r==1){ injected++; }
-                else if(r==-1){ need_inval=1; }
-                else if(r==0){
-                    /* Credit window full (link busy: input/video wants airtime).
-                     * Audio (0x36) with the FIFO enabled -> HOLD it (few-ms delay,
-                     * drained above on the next arrival) rather than punch a ~10ms
-                     * hole. Rumble (0x31/0x32) and FIFO-off stay latest-wins: a stale
-                     * rumble is wrong, so drop. FIFO overflow -> drop OLDEST so total
-                     * added latency stays bounded by fdepth frames. */
-                    if(rep[0]==0x36 && fdepth>0 && (int)n<=FIFO_ENTRY_MAX){
-                        if(g_fifo_count>=fdepth){ g_fifo_head=(g_fifo_head+1)%FIFO_MAX; g_fifo_count--; dropped++; }
-                        int tail=(g_fifo_head+g_fifo_count)%FIFO_MAX;
-                        memcpy(g_fifo[tail].buf,rep,(size_t)n); g_fifo[tail].len=(int)n; g_fifo_count++;
+                if(rep[0]!=0x36){
+                    /* Rumble FIRST, before the audio backlog: it is an independent
+                     * stream (its ordering vs audio does not matter), and draining
+                     * held audio ahead of it would hand every freed credit to audio
+                     * within the same wakeup — starvation by ordering, on top of
+                     * the type-aware window in inject_one(). Rumble itself stays
+                     * latest-wins on a full window: a stale rumble is wrong. */
+                    r=inject_one(rawfd,rep,(int)n,maxq,&reason);
+                    if(r==1) injected++;
+                    else if(r==-1) need_inval=1;
+                    else if(r==0) paced++;         /* latest-wins drop */
+                    else dropped++;                /* r==-2: no live template */
+                    if(!need_inval) injected+=drain_fifo(rawfd,maxq,&need_inval,&reason);
+                } else {
+                    /* Audio: strict FIFO order — backlog first, then the fresh
+                     * frame. On a full window with the FIFO enabled the fresh frame
+                     * is HELD (few-ms delay, drained on the next arrival) rather
+                     * than punching a ~10ms hole; FIFO-off stays latest-wins. */
+                    injected+=drain_fifo(rawfd,maxq,&need_inval,&reason);
+                    if(need_inval){
+                        dropped++;                 /* template just died; fresh frame is moot */
                     } else {
-                        paced++;   /* legacy latest-wins drop */
+                        r=inject_one(rawfd,rep,(int)n,maxq,&reason);
+                        if(r==1) injected++;
+                        else if(r==-1){ need_inval=1; fifo_clear(); }
+                        else if(r==0){
+                            if(fdepth>0 && (int)n<=FIFO_ENTRY_MAX){
+                                /* Evict-to-fit: fdepth can be LOWERED at runtime; a
+                                 * single-evict would balance every insert and keep
+                                 * the count at the old high-water forever under
+                                 * congestion, voiding the latency bound. */
+                                while(g_fifo_count>=fdepth){ g_fifo_head=(g_fifo_head+1)%FIFO_MAX; g_fifo_count--; dropped++; }
+                                int tail=(g_fifo_head+g_fifo_count)%FIFO_MAX;
+                                memcpy(g_fifo[tail].buf,rep,(size_t)n); g_fifo[tail].len=(int)n; g_fifo_count++;
+                            } else {
+                                paced++;           /* legacy latest-wins drop */
+                            }
+                        }
+                        else dropped++;            /* r==-2: no live template */
                     }
                 }
-                else { dropped++; }   /* r==-2: no live template */
                 if(need_inval){ publish_current(); fprintf(stderr,"[txd] %s\n",reason); }
             }
         }
-        if(now_ms()-last_log>10000){ fprintf(stderr,"[txd] inj=%ld drop=%ld backoff=%ld q=%d/%d fifo=%d/%d scanctr=%ld gaps=%ld/%ld/%ld%s\n",injected,dropped,paced,g_outstanding,inject_maxq(),g_fifo_count,inject_fifo(),g_scan_ctr,g_gap30,g_gap50,g_gap80,g_cmd_dead?" CMDDEAD":""); last_log=now_ms(); }
+        if(now_ms()-last_log>10000){ fprintf(stderr,"[txd] inj=%ld drop=%ld backoff=%ld q=%d/%d rq=%d fifo=%d/%d scanctr=%ld gaps=%ld/%ld/%ld%s\n",injected,dropped,paced,g_outstanding,inject_maxq(),g_rumble_fly,g_fifo_count,inject_fifo(),g_scan_ctr,g_gap30,g_gap50,g_gap80,g_cmd_dead?" CMDDEAD":""); last_log=now_ms(); }
     }
     return 0;
 }
