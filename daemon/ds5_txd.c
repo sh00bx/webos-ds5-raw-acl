@@ -346,34 +346,73 @@ static long drain_fifo(int rawfd, int maxq, int *need_inval, const char **reason
 }
 static int      g_rawfd = -1;          /* main's raw HCI socket, shared for link-policy writes */
 
-/* HCI command health guard + rate discipline (2026-07-05, corrected same
- * night). PROVEN on-air (raw-write + monitor-listen probe): the LG vendor
- * stack holds the adapter in user-channel mode — the controller answers every
- * command fine, but the responses bypass the kernel's command tracking. So
- * EVERY command we send via the kernel path occupies a 2s "command tx timeout"
+/* HCI command health guard + rate discipline (2026-07-05, reworked 07-06).
+ * PROVEN on-air (raw-write + monitor-listen probe): the LG vendor stack holds
+ * the adapter in user-channel mode — the controller answers every command
+ * fine, but the responses bypass the kernel's command tracking. So EVERY
+ * command we send via the kernel path occupies a 2s "command tx timeout"
  * slot; the kernel drains OUR queue at a fixed 1 command / 2s (0.5/s). Send
  * faster than that for long enough and the socket sndbuf overflows (~30min at
  * the old 1Hz scan war) -> permanent EAGAIN and our scan-offs arrive minutes
  * late (the night's "firmware wedge" + "dropouts got worse", both really this
- * arithmetic). Rules: (a) total command rate must stay well under 0.5/s
- * (10s link-policy + >=3s-ratelimited scan counter = <=0.43/s worst case);
- * (b) a command's Command Complete is watched on the MONITOR socket (sees
- * responses even in user-channel mode) with a 6s deadline (queue slots can
- * stack ~2s each) -> miss = cease ALL commands for the daemon's lifetime;
- * (c) EAGAIN on a command write (= sndbuf already full) trips immediately.
+ * arithmetic). Rules:
+ *  (a) steady-state command rate stays well under the 0.5/s drain (10s
+ *      link-policy refresh + >=3s-ratelimited scan sends <= 0.43/s typical);
+ *      BURSTS (template flap = invalidate+rebind = up to 3 commands) are
+ *      absorbed by a hard unacked-queue cap (CMD_PEND_MAX): once that many
+ *      commands await their Command Complete, further sends are refused and
+ *      the reconcilers simply retry later — the sndbuf can never build more
+ *      than ~CMD_PEND_MAX*2s of backlog no matter how hard the session flaps.
+ *  (b) every sent command is queued with its timestamp and watched for a
+ *      Command Complete on the MONITOR socket (sees responses even in
+ *      user-channel mode). The no-response deadline SCALES with the queue
+ *      depth we created ourselves — N unacked commands legitimately take
+ *      ~2N s to drain, so a fixed deadline false-tripped on a mere flap
+ *      burst — miss = cease commands and enter the DEAD state;
+ *  (c) EAGAIN on a command write (= sndbuf already full) trips immediately;
+ *  (d) DEAD is no longer terminal: every 60s ONE probe command is sent past
+ *      the gate; a monitor-observed Command Complete for it clears the state
+ *      (logged CMDRECOVER). A foreign completion of the same opcode inside
+ *      the probe window can recover us spuriously — harmless, the guard
+ *      re-trips on the next unanswered command if the path is really dead.
  * Raw-ACL injection bypasses the cmd queue and is unaffected.
  * All fields are capture-thread-only, no locking needed. */
 static volatile int g_cmd_dead = 0;
+static uint64_t g_cmd_dead_t = 0;    /* trip time; schedules the 60s recovery probes */
+static uint16_t g_probe_op   = 0;    /* recovery probe awaiting Command Complete */
 static volatile long g_scan_ctr = 0; /* foreign scan re-enables countered (fight-rate telemetry) */
 static long g_gap30=0, g_gap50=0, g_gap80=0; /* NOCP-gap histogram 30-50/50-80/>=80ms (main thread) */
-static uint16_t g_pend_op = 0;      /* our in-flight command awaiting Command Complete */
-static uint64_t g_pend_t  = 0;
+#define CMD_PEND_MAX 8
+static struct { uint16_t op; uint64_t deadline; } g_pend[CMD_PEND_MAX];
+static int g_pend_n = 0;             /* commands written but with no Command Complete seen yet */
 static void cmd_guard_trip(const char *why, unsigned detail){
     if(g_cmd_dead) return;
-    g_cmd_dead=1;
-    fprintf(stderr,"[txd] HCI COMMAND PATH DEAD (%s 0x%04x) -> ceasing all HCI commands "
-                   "(scan/sniff mgmt off; ACL inject unaffected).\n",
+    g_cmd_dead=1; g_cmd_dead_t=now_ms(); g_pend_n=0;
+    fprintf(stderr,"[txd] HCI COMMAND PATH DEAD (%s 0x%04x) -> ceasing HCI commands "
+                   "(scan/sniff mgmt paused; ACL inject unaffected; recovery probe every 60s).\n",
             why,detail);
+}
+/* Single choke point for HCI commands: dead-gate, unacked-queue cap, EAGAIN
+ * trip, pend bookkeeping. force=1 is reserved for the recovery probe.
+ * Returns 0 = written (pend entry queued), -1 = not sent (caller retries). */
+static int cmd_send(const uint8_t *cmd, size_t len, uint16_t op, int force){
+    if(g_rawfd<0) return -1;
+    if(g_cmd_dead && !force) return -1;
+    if(g_pend_n>=CMD_PEND_MAX) return -1;          /* >=16s of drain already queued: refuse */
+    if(write(g_rawfd,cmd,len)!=(ssize_t)len){
+        if(errno==EAGAIN||errno==EWOULDBLOCK) cmd_guard_trip("write EAGAIN",op);
+        else fprintf(stderr,"[txd] hci cmd 0x%04x write failed: %s\n",op,strerror(errno));
+        return -1;
+    }
+    /* The no-response deadline is fixed at ENQUEUE from the entry's queue
+     * position: with N entries already ahead, the kernel needs ~2s each before
+     * this one even goes on air. Scaling by the CURRENT depth instead would
+     * shrink the allowance as earlier entries complete while the survivor's age
+     * keeps growing — the tail of a full burst would false-trip. */
+    g_pend[g_pend_n].op=op;
+    g_pend[g_pend_n].deadline=now_ms()+6000ull+2000ull*(uint64_t)(g_pend_n+1);
+    g_pend_n++;
+    return 0;
 }
 
 /* Disable sniff/hold/park on the DS5 ACL link (keep role-switch). Measured live
@@ -385,16 +424,12 @@ static void cmd_guard_trip(const char *why, unsigned detail){
  * socket is atomic, so racing with main's ACL injects is safe. */
 #define OP_WRITE_LINK_POLICY 0x080d
 #define LINK_POLICY_ACTIVE   0x0001    /* role switch only; sniff/hold/park off */
-static void send_link_policy(uint16_t handle){
-    if(g_rawfd<0 || g_cmd_dead) return;
+static int send_link_policy(uint16_t handle){
     uint8_t cmd[8]={ 0x01 /*HCI_COMMAND_PKT*/,
         OP_WRITE_LINK_POLICY&0xff, OP_WRITE_LINK_POLICY>>8, 4,
         (uint8_t)(handle&0xff), (uint8_t)((handle>>8)&0x0f),
         LINK_POLICY_ACTIVE&0xff, LINK_POLICY_ACTIVE>>8 };
-    if(write(g_rawfd,cmd,sizeof cmd)!=(ssize_t)sizeof cmd){
-        if(errno==EAGAIN||errno==EWOULDBLOCK) cmd_guard_trip("write EAGAIN",OP_WRITE_LINK_POLICY);
-        else fprintf(stderr,"[txd] link-policy write failed: %s\n",strerror(errno));
-    } else if(!g_pend_op){ g_pend_op=OP_WRITE_LINK_POLICY; g_pend_t=now_ms(); }
+    return cmd_send(cmd,sizeof cmd,OP_WRITE_LINK_POLICY,0);
 }
 
 /* BR/EDR scan control (Write_Scan_Enable). Measured live 2026-07-05: the
@@ -402,24 +437,34 @@ static void send_link_policy(uint16_t handle){
  * 86-234ms on a ~1.28s grid (EPISODE detector) — audible speaker dropouts and
  * the input hiccups. Scan-off while a template is bound removed ~8x of the
  * blackouts and made input clean in the live A/B. Scan mode 2 (connectable,
- * not discoverable) is restored whenever the template goes invalid so devices
- * can (re)connect outside sessions. The LG stack re-enables scans on its own;
- * countered event-driven from the monitor's command stream (capture_thread). */
+ * not discoverable) is restored when the template goes invalid so devices can
+ * (re)connect outside sessions.
+ *
+ * Implemented as a WANT/SENT reconciler instead of scattered direct sends:
+ * every state change (bind, invalidate — from ANY thread via g_scan_restore —
+ * or a foreign re-enable observed on the monitor) only updates the DESIRED
+ * mode; the capture loop converges the actual mode toward it under one shared
+ * >=3s limiter. This makes flap storms rate-safe by construction (a swallowed
+ * transition is re-sent on the next pass, so the final state is always
+ * reached) and keeps the whole command machinery capture-thread-only. */
 #define OP_WRITE_SCAN_ENABLE 0x0c1a
-static void send_scan_enable(uint8_t mode){
-    static uint8_t last_sent=0xff;
-    if(g_rawfd<0 || g_cmd_dead) return;
+#define SCAN_MIN_GAP_MS      3000
+static uint8_t  g_scan_want = 0xff;  /* desired mode; 0xff = no opinion yet (pre-first-bind:
+                                        never touch the TV's scan state before a session) */
+static uint8_t  g_scan_sent = 0xff;  /* mode we last wrote; 0xff = unknown (force re-send) */
+static uint64_t g_scan_tx   = 0;     /* last scan write time (the shared limiter) */
+static volatile int g_scan_restore = 0; /* main-thread invalidations request a mode-2 restore
+                                           here; the capture thread owns the send machinery */
+static void scan_reconcile(void){
+    if(g_scan_want==0xff || g_scan_want==g_scan_sent) return;
+    uint64_t t=now_ms();
+    if(g_scan_tx && t-g_scan_tx<SCAN_MIN_GAP_MS) return;
     uint8_t cmd[5]={ 0x01,
-        OP_WRITE_SCAN_ENABLE&0xff, OP_WRITE_SCAN_ENABLE>>8, 1, mode };
-    if(write(g_rawfd,cmd,sizeof cmd)!=(ssize_t)sizeof cmd){
-        if(errno==EAGAIN||errno==EWOULDBLOCK) cmd_guard_trip("write EAGAIN",OP_WRITE_SCAN_ENABLE);
-        else fprintf(stderr,"[txd] scan-enable write failed: %s\n",strerror(errno));
-    } else {
-        if(!g_pend_op){ g_pend_op=OP_WRITE_SCAN_ENABLE; g_pend_t=now_ms(); }
-        if(mode!=last_sent){
-            fprintf(stderr,"[txd] scan_enable=%u (%s)\n",mode,mode?"restored":"off for session");
-            last_sent=mode;
-        }
+        OP_WRITE_SCAN_ENABLE&0xff, OP_WRITE_SCAN_ENABLE>>8, 1, g_scan_want };
+    if(cmd_send(cmd,sizeof cmd,OP_WRITE_SCAN_ENABLE,0)==0){
+        g_scan_tx=t; g_scan_sent=g_scan_want;
+        fprintf(stderr,"[txd] scan_enable=%u (%s)\n",g_scan_want,
+                g_scan_want?"restored":"off for session");
     }
 }
 
@@ -673,7 +718,16 @@ static void handle_hci_event(const uint8_t *e, int el){
     const char *reason=NULL;
     if(code==HCI_EV_CMD_COMPLETE && pl>=3){                 /* ncmd,opcode(2),status... */
         uint16_t op=(uint16_t)(p[1]|(p[2]<<8));
-        if(g_pend_op && op==g_pend_op) g_pend_op=0;         /* our command got answered */
+        for(int i=0;i<g_pend_n;i++)                         /* pop the oldest matching pend */
+            if(g_pend[i].op==op){
+                g_pend_n--;
+                memmove(&g_pend[i],&g_pend[i+1],(size_t)(g_pend_n-i)*sizeof g_pend[0]);
+                break;
+            }
+        if(g_cmd_dead && g_probe_op && op==g_probe_op){     /* recovery probe answered */
+            g_cmd_dead=0; g_probe_op=0; g_pend_n=0;
+            fprintf(stderr,"[txd] CMDRECOVER: Command Complete 0x%04x on air -> HCI command path back up\n",op);
+        }
         return;
     }
     if(code==HCI_EV_CONN_COMPLETE && pl>=9){                /* status,handle(2),bdaddr(6),... */
@@ -734,7 +788,7 @@ static void handle_hci_event(const uint8_t *e, int el){
         pthread_mutex_unlock(&g_lock);
         return;   /* NOCP never affects template validity */
     } else return;
-    if(reason){ publish_current(); fprintf(stderr,"[txd] %s -> template INVALID\n",reason); send_scan_enable(2); }
+    if(reason){ publish_current(); fprintf(stderr,"[txd] %s -> template INVALID\n",reason); g_scan_want=2; }
 }
 
 /* Best-effort: seed/refresh the handle->bdaddr table from the kernel's current
@@ -786,32 +840,59 @@ static void *capture_thread(void *arg){
     if(bind(mfd,(struct sockaddr*)&ma,sizeof ma)<0){ perror("[txd] bind monitor"); close(mfd); return NULL; }
     struct timeval tv={.tv_sec=0,.tv_usec=300000}; setsockopt(mfd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
     uint8_t buf[2048];
-    uint64_t last_learn=0, last_policy=0, last_scan=0;
+    uint64_t last_learn=0, last_policy=0;
+    uint16_t policy_handle=0xffff;   /* handle the last link-policy write was for */
     for(;;){
         /* Idle backstop: evaluated EVERY wakeup (not only on recv-timeout) so it
          * still fires while other BT devices keep the monitor socket busy. After a
          * flap the DS5 stops emitting HID-output -> g_last_seen ages out -> template
          * invalidated within IDLE_INVALIDATE_MS even if the DISCONN event was lost. */
-        int idle_inval=0; int reassert_handle=-1;
+        int idle_inval=0; int bh=-1;
         pthread_mutex_lock(&g_lock);
         if(g_have && now_ms()-g_last_seen>IDLE_INVALIDATE_MS){ g_have=0; idle_inval=1; }
-        if(g_have && now_ms()-last_policy>10000){ last_policy=now_ms(); reassert_handle=g_handle; }
+        if(g_have) bh=g_handle;
         pthread_mutex_unlock(&g_lock);
-        if(idle_inval){ publish_current(); fprintf(stderr,"[txd] link idle -> template INVALID\n"); send_scan_enable(2); }
-        /* Re-assert the no-sniff link policy every 10 s while bound: the LG stack can
-         * rewrite the policy on its own events, and the command is a no-op on air.
-         * (10s not 5s: kernel drains our commands at 0.5/s, see guard comment.) */
-        if(reassert_handle>=0) send_link_policy((uint16_t)reassert_handle);
-        /* Command health: a sent command with no ON-AIR Command Complete within 6s
-         * (monitor-observed; kernel queue slots stack ~2s each, so allow a couple)
-         * means the command path is genuinely dead -> stop all commands before our
-         * retries fill the sndbuf. (The blind 1Hz scan-off reassert that used to
-         * live here is gone: at 1.2 cmd/s vs the 0.5/s kernel drain it overflowed
-         * the sndbuf after ~30min and starved its own scan-offs. Scan-off is now
-         * countered event-driven in the MON_COMMAND_PKT branch below.) */
-        if(g_pend_op && now_ms()-g_pend_t>6000){
-            uint16_t op=g_pend_op; g_pend_op=0;
-            cmd_guard_trip("no response to",op);
+        if(idle_inval){ publish_current(); fprintf(stderr,"[txd] link idle -> template INVALID\n"); g_scan_want=2; }
+        /* Main-thread invalidations (EBADF / foreign-handle caught in inject_one)
+         * cannot touch the command machinery (g_pend/scan state is capture-thread-
+         * -owned); they raise g_scan_restore instead and the restore lands here.
+         * Skipped if a new session already rebound meanwhile — want stays 0. */
+        if(g_scan_restore){ g_scan_restore=0; if(bh<0) g_scan_want=2; }
+        /* Link-policy reconcile: pin sniff off within ~300ms of a bind (handle
+         * change) and refresh every 10s while bound; never more often than every
+         * 3s so a flap storm cannot flood the 0.5/s kernel drain (bursts beyond
+         * that are additionally absorbed by cmd_send's unacked-queue cap). */
+        if(bh>=0){
+            uint64_t t=now_ms();
+            int need = (policy_handle!=(uint16_t)bh) || (t-last_policy>10000);
+            if(need && (!last_policy || t-last_policy>3000) &&
+               send_link_policy((uint16_t)bh)==0){ last_policy=t; policy_handle=(uint16_t)bh; }
+        } else policy_handle=0xffff;
+        /* Converge the actual scan mode toward the desired one (shared limiter). */
+        scan_reconcile();
+        /* Command health: no ON-AIR Command Complete (monitor-observed) for the
+         * OLDEST unacked command by its enqueue-time deadline (6s + 2s per queue
+         * position — the kernel drains 1 cmd / 2s in user-channel mode, so a
+         * burst legitimately takes that long; a fixed 6s deadline used to
+         * false-trip on a mere template-flap burst of 3 commands). Miss = enter
+         * the DEAD state before retries fill the sndbuf. */
+        if(!g_cmd_dead && g_pend_n>0 && now_ms()>g_pend[0].deadline){
+            cmd_guard_trip("no response to",g_pend[0].op);
+        }
+        /* Recovery probe: DEAD is not terminal. Every 60s send ONE command past
+         * the gate — the currently-desired scan mode, so a successful recovery
+         * also reconciles scan state. Pre-probe the pend queue holds only dead-era
+         * junk (nothing else is sent while dead); drop it so 8 failed probes can
+         * never wedge the queue cap and stop probing forever. */
+        if(g_cmd_dead && now_ms()-g_cmd_dead_t>60000){
+            g_cmd_dead_t=now_ms(); g_pend_n=0;
+            uint8_t mode=(g_scan_want!=0xff)?g_scan_want:2;
+            uint8_t cmd[5]={ 0x01,
+                OP_WRITE_SCAN_ENABLE&0xff, OP_WRITE_SCAN_ENABLE>>8, 1, mode };
+            if(cmd_send(cmd,sizeof cmd,OP_WRITE_SCAN_ENABLE,1)==0){
+                g_probe_op=OP_WRITE_SCAN_ENABLE;
+                g_scan_tx=now_ms(); g_scan_sent=mode;
+            }
         }
 
         int r=(int)recv(mfd,buf,sizeof buf,0);
@@ -829,15 +910,17 @@ static void *capture_thread(void *arg){
         if(h->opcode==MON_COMMAND_PKT){
             /* Event-driven scan-off: the LG stack re-enables page/inquiry scan on
              * its own (measured: scan blackouts leak back within seconds). Instead
-             * of a blind 1Hz reassert we watch the command stream and counter a
-             * foreign Write_Scan_Enable with mode!=0 while a session is bound —
-             * zero commands from us unless someone actually flips scan back on.
-             * Our own writes are mode=0 and can't retrigger. Payload: opcode(2LE),
-             * plen(1), params. */
-            if(dl>=4 && (uint16_t)(d[0]|(d[1]<<8))==OP_WRITE_SCAN_ENABLE && d[3]!=0){
-                int bound; pthread_mutex_lock(&g_lock); bound=g_have; pthread_mutex_unlock(&g_lock);
-                uint64_t t=now_ms();
-                if(bound && t-last_scan>3000){ last_scan=t; g_scan_ctr++; send_scan_enable(0); }
+             * of a blind 1Hz reassert we watch the command stream: a foreign
+             * Write_Scan_Enable with mode!=0 while we want it off just marks our
+             * sent-state unknown — the reconciler re-sends mode 0 under the shared
+             * >=3s limiter on the next pass. Zero commands from us unless someone
+             * actually flips scan back on; our own writes while want==0 are mode=0
+             * and can't retrigger (and our mode-2 restores run while want==2).
+             * Payload: opcode(2LE), plen(1), params. */
+            if(dl>=4 && (uint16_t)(d[0]|(d[1]<<8))==OP_WRITE_SCAN_ENABLE && d[3]!=0 &&
+               g_scan_want==0){
+                if(g_scan_sent==0) g_scan_ctr++;   /* count fights, not every burst packet */
+                g_scan_sent=0xff;
             }
             continue;
         }
@@ -886,9 +969,13 @@ static void *capture_thread(void *arg){
         pthread_mutex_unlock(&g_lock);
         if(did_capture){
             publish_current();
-            send_link_policy(hh);   /* pin the link ACTIVE the moment we bind it */
-            send_scan_enable(0);    /* session radio hygiene: no page/inquiry scan blackouts */
-            fprintf(stderr,"[txd] template handle=0x%03x CID=0x%04x nonce=%u bound (sniff off, noscan)\n",hh,cid,nonce);
+            /* Radio hygiene via the reconcilers (next loop pass, <=300ms): the
+             * link-policy pin fires on the handle change, scan-off on want=0.
+             * Direct sends here were unthrottled — a flap storm (bind/invalidate
+             * cycling) could beat the 0.5/s kernel drain and overflow the sndbuf. */
+            g_scan_want=0;
+            policy_handle=0xffff;
+            fprintf(stderr,"[txd] template handle=0x%03x CID=0x%04x nonce=%u bound (sniff-off+noscan pending)\n",hh,cid,nonce);
         }
         if(need_learn){
             /* Throttled refresh of the handle->bdaddr table for the case where the
@@ -1069,7 +1156,7 @@ int main(int argc,char**argv){
                 if(need_inval){ publish_current(); fprintf(stderr,"[txd] %s\n",reason); }
             }
         }
-        if(now_ms()-last_log>10000){ fprintf(stderr,"[txd] inj=%ld drop=%ld backoff=%ld q=%d/%d rq=%d fifo=%d/%d scanctr=%ld gaps=%ld/%ld/%ld%s\n",injected,dropped,paced,g_outstanding,inject_maxq(),g_rumble_fly,g_fifo_count,inject_fifo(),g_scan_ctr,g_gap30,g_gap50,g_gap80,g_cmd_dead?" CMDDEAD":""); last_log=now_ms(); }
+        if(now_ms()-last_log>10000){ fprintf(stderr,"[txd] inj=%ld drop=%ld backoff=%ld q=%d/%d rq=%d fifo=%d/%d scanctr=%ld gaps=%ld/%ld/%ld pend=%d%s\n",injected,dropped,paced,g_outstanding,inject_maxq(),g_rumble_fly,g_fifo_count,inject_fifo(),g_scan_ctr,g_gap30,g_gap50,g_gap80,g_pend_n,g_cmd_dead?" CMDDEAD":""); last_log=now_ms(); }
     }
     return 0;
 }
