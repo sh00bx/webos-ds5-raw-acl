@@ -323,9 +323,14 @@ static int inject_one(int rawfd, const uint8_t *rep, int n, int maxq, const char
     return r;
 }
 
-/* Audio-only elastic FIFO (single-threaded: touched only by the main poll loop). */
+/* Audio-only elastic FIFO (single-threaded: touched only by the main poll loop).
+ * g_fifo_gen stamps the backlog with the template nonce it was queued under, so
+ * frames held across an invalidate->rebind (a new session, new nonce) are
+ * recognized as stale and dropped instead of being injected as a burst of
+ * last-session audio at the head of the new one. */
 static struct { uint8_t buf[FIFO_ENTRY_MAX]; int len; } g_fifo[FIFO_MAX];
 static int g_fifo_head=0, g_fifo_count=0;
+static uint16_t g_fifo_gen=0;
 static void fifo_clear(void){ g_fifo_head=0; g_fifo_count=0; }
 
 /* Drain the audio backlog oldest-first while credits allow (main thread only).
@@ -340,7 +345,8 @@ static long drain_fifo(int rawfd, int maxq, int *need_inval, const char **reason
         int r=inject_one(rawfd,g_fifo[idx].buf,g_fifo[idx].len,maxq,reason);
         if(r==1){ g_fifo_head=(g_fifo_head+1)%FIFO_MAX; g_fifo_count--; inj++; continue; }
         if(r==-1){ *need_inval=1; fifo_clear(); }  /* template gone -> drop stale audio */
-        break;                                     /* credits full (0) or no template (-2) */
+        else if(r==-2) fifo_clear();               /* no template: backlog is already stale */
+        break;                                     /* credits full (0) -> retry next wakeup */
     }
     return inj;
 }
@@ -1063,12 +1069,19 @@ int main(int argc,char**argv){
          * means the controller is not getting airtime (WiFi-scan blackout,
          * interference burst) -- the invisible cause of "late but not lost"
          * audio/input. Timestamped so felt dropouts can be correlated. */
+        uint16_t snap_nonce=0;   /* template generation this wakeup (stamps FIFO entries) */
         {
             static uint64_t ep_start=0, gap_hi=0;
             uint64_t nowm=now_ms();
             pthread_mutex_lock(&g_lock);
             int qd=g_outstanding; uint64_t ln=g_last_nocp; int hv=g_have;
+            snap_nonce=g_nonce;
             pthread_mutex_unlock(&g_lock);
+            /* Stale-backlog gate: a rebind bumps the nonce, so audio still held
+             * from the previous binding must be dropped, not played into the new
+             * session (drain_fifo also clears on the no-template path, but that
+             * never runs when the invalidate->rebind happens between wakeups). */
+            if(g_fifo_count>0 && g_fifo_gen!=snap_nonce) fifo_clear();
             if(hv && qd>0 && ln && nowm-ln>80){
                 if(!ep_start){ ep_start=nowm; fprintf(stderr,"[txd] EPISODE start t=%llu q=%d\n",(unsigned long long)nowm,qd); }
             } else if(ep_start){
@@ -1146,6 +1159,7 @@ int main(int argc,char**argv){
                                 while(g_fifo_count>=fdepth){ g_fifo_head=(g_fifo_head+1)%FIFO_MAX; g_fifo_count--; dropped++; }
                                 int tail=(g_fifo_head+g_fifo_count)%FIFO_MAX;
                                 memcpy(g_fifo[tail].buf,rep,(size_t)n); g_fifo[tail].len=(int)n; g_fifo_count++;
+                                g_fifo_gen=snap_nonce;   /* held under THIS binding */
                             } else {
                                 paced++;           /* legacy latest-wins drop */
                             }
@@ -1153,7 +1167,16 @@ int main(int argc,char**argv){
                         else dropped++;            /* r==-2: no live template */
                     }
                 }
-                if(need_inval){ publish_current(); fprintf(stderr,"[txd] %s\n",reason); }
+                if(need_inval){
+                    publish_current(); fprintf(stderr,"[txd] %s\n",reason);
+                    /* Scan restore for MAIN-thread invalidations: this thread must
+                     * not touch the capture-owned command machinery, so it only
+                     * raises the flag; the capture loop sends the mode-2 restore
+                     * (and ignores it if a new session rebinds first). Without
+                     * this, an EBADF/foreign-handle invalidation left page scan
+                     * off until the LG stack happened to re-enable it. */
+                    g_scan_restore=1;
+                }
             }
         }
         if(now_ms()-last_log>10000){ fprintf(stderr,"[txd] inj=%ld drop=%ld backoff=%ld q=%d/%d rq=%d fifo=%d/%d scanctr=%ld gaps=%ld/%ld/%ld pend=%d%s\n",injected,dropped,paced,g_outstanding,inject_maxq(),g_rumble_fly,g_fifo_count,inject_fifo(),g_scan_ctr,g_gap30,g_gap50,g_gap80,g_pend_n,g_cmd_dead?" CMDDEAD":""); last_log=now_ms(); }
