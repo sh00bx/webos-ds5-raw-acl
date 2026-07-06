@@ -1,0 +1,15 @@
+#!/bin/sh
+# webosbrew boot hook (run-parts /var/lib/webosbrew/init.d): start the jail
+# hidraw mirror watcher as a detached daemon. The Aurora jail's /dev is a
+# STATIC template (hidraw0-4 only, from jail build time); when the BT DualSense
+# enumerates on a host minor > 4 the node is missing in-jail and the app's hid
+# open fails errno=2 ("unknown HID device"). The watcher mirrors
+# /sys/class/hidraw into the jail /dev (same name/major:minor, mode 0666).
+# Fire-and-forget: a hung/crashing boot hook would trip webosbrew failsafe.
+# Filename has NO dot on purpose (busybox run-parts skips names with dots).
+# NOTE: busybox start-stop-daemon's --exec already-running check can NOT match a
+# shell script (it compares /proc/<pid>/exe, which for a script is the
+# interpreter /bin/sh, never the script path) — the REAL duplicate-start guard
+# is the pidfile check inside hidraw-mirrord.sh itself. --background is kept
+# only to detach the watcher so this hook returns immediately.
+start-stop-daemon --start --background --exec /var/lib/webosbrew/hidraw-mirrord.sh
