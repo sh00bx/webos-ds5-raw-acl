@@ -23,15 +23,38 @@ PIDFILE=/tmp/ds5-tmpld.pid
 # running script is the INTERPRETER /bin/sh -> busybox, never the script path), so
 # a hook re-run (manual start, hbchannel restart, webosbrew re-elevation) would
 # spawn a second supervisor + ds5_txd, and the pair would unlink-steal the
-# rendezvous sockets from each other on every remount. Guard here instead:
-# pidfile + liveness + cmdline check (a recycled pid of some other process, or a
-# stale file from a crash, is treated as stale and taken over).
-OLD=$(cat "$PIDFILE" 2>/dev/null)
-if [ -n "$OLD" ] && [ "$OLD" != "$$" ] && kill -0 "$OLD" 2>/dev/null \
-   && grep -q ds5-tmpld "/proc/$OLD/cmdline" 2>/dev/null; then
-  exit 0   # a live supervisor already owns the pidfile
-fi
-echo $$ >"$PIDFILE"
+# rendezvous sockets from each other on every remount. Guard here instead.
+#
+# Acquisition is ATOMIC (noclobber create): a plain read-check-write had a
+# TOCTOU hole — two simultaneous starts both saw no live owner and both wrote
+# the pidfile, i.e. exactly the dual-supervisor failure this guard exists to
+# stop. A stale file (crash leftover, recycled pid) is CLAIMED by rename first:
+# mv is atomic, so of several racers exactly one removes it; the rest re-loop
+# and either lose the create (and find the winner live) or exit.
+#
+# Liveness anchors on the process IDENTITY, not just cmdline bytes: a recycled
+# pid whose cmdline merely mentions the name (vi/tail/grep on this file) must
+# not count as a supervisor, or a crash could never be recovered from. A real
+# supervisor is the script exec'd directly (the kernel sets comm to the script
+# basename for a shebang exec) or a shell interpreting it.
+is_live_supervisor() {
+  kill -0 "$1" 2>/dev/null || return 1
+  grep -q "ds5-tmpld" "/proc/$1/cmdline" 2>/dev/null || return 1
+  case "$(cat "/proc/$1/comm" 2>/dev/null)" in
+    ds5-tmpld*|sh|ash|dash|busybox) return 0 ;;
+  esac
+  return 1
+}
+while :; do
+  if ( set -C && echo "$$" > "$PIDFILE" ) 2>/dev/null; then
+    break   # we own the pidfile
+  fi
+  OLD=$(cat "$PIDFILE" 2>/dev/null)
+  if [ -n "$OLD" ] && is_live_supervisor "$OLD"; then
+    exit 0  # a live supervisor already owns it
+  fi
+  mv -f "$PIDFILE" "$PIDFILE.stale.$$" 2>/dev/null && rm -f "$PIDFILE.stale.$$"
+done
 
 # Take ds5_txd off real-time AND split priorities so neither thread hurts the
 # CTM usbip input thread, while keeping haptic tight:
