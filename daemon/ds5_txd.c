@@ -308,9 +308,18 @@ struct ds5_link {
     int      tx_head, tx_cnt;
     int      rumble_fly;     /* believed-in-flight rumble packets */
     /* audio elastic FIFO (inject) — see inject_fifo() */
-    struct { uint8_t buf[FIFO_ENTRY_MAX]; int len; } fifo[FIFO_MAX];
+    struct { uint8_t buf[FIFO_ENTRY_MAX]; int len; uint64_t ts; } fifo[FIFO_MAX];
     int      fifo_head, fifo_count;
     uint16_t fifo_gen;       /* nonce the held backlog was queued under (stale-drop) */
+    /* previous identity pending an invalid-publish (g_lock). When a slot is
+     * re-bound to a DIFFERENT pad before the old pad's invalidation was
+     * published (main-thread invalidate racing a capture rebind), the old
+     * address is no longer in any slot and publish_all() would never write its
+     * per-address file again — the evicted pad's client would keep forwarding
+     * against a stale valid=1 record forever. link_bind stages the outgoing
+     * address here; the next publish_all() emits one valid=0 record for it. */
+    uint8_t  prev_addr[6];
+    int      prev_valid;
     /* per-link link-policy pin (cap) */
     uint16_t policy_handle;  /* handle the last link-policy write was for */
     uint64_t last_policy;
@@ -439,6 +448,12 @@ static struct ds5_link *link_by_addr(const uint8_t addr[6]){
     return NULL;
 }
 static struct ds5_link *free_slot(void){
+    /* Prefer a virgin slot: an idle-invalidated slot still carries another
+     * pad's sticky ever_bound identity, and overwriting it while a never-bound
+     * slot sits free silently disables that pad's idle sniff-pin (the pin loop
+     * keys on ever_bound + bound_addr) and defeats slot_for_addr's stickiness
+     * when the pad returns. */
+    for(int i=0;i<MAX_LINKS;i++) if(!g_links[i].have && !g_links[i].ever_bound) return &g_links[i];
     for(int i=0;i<MAX_LINKS;i++) if(!g_links[i].have) return &g_links[i];
     return NULL;
 }
@@ -466,6 +481,11 @@ static int any_link_bound_locked(void){
  * dropped, and resets the credit window so we never inherit phantom credits (or
  * per-type counts) from a flapped connection whose NOCPs were lost. */
 static void link_bind(struct ds5_link *L, const uint8_t hdr8[8], uint16_t hh){
+    if(L->ever_bound && memcmp(L->bound_addr,g_htab[hh].addr,6)!=0){
+        /* Slot changes owner: stage the outgoing pad's address so the next
+         * publish_all() writes its per-address file valid=0 (see prev_addr). */
+        memcpy(L->prev_addr,L->bound_addr,6); L->prev_valid=1;
+    }
     memcpy(L->hdr,hdr8,8); L->handle=hh; memcpy(L->bound_addr,g_htab[hh].addr,6);
     L->bound_known=1; L->have=1; L->ever_bound=1; L->nonce++;
     L->assert_learned=g_htab[hh].from_assert;   /* inherit the handle's taint: a rebind
@@ -568,10 +588,20 @@ static void fifo_clear(struct ds5_link *L){ L->fifo_head=0; L->fifo_count=0; }
  * backlog instead of stranding it. Returns the number injected; on template
  * invalidation sets need_inval + reason (caller publishes) and drops the stale
  * backlog. */
+#define FIFO_MAX_AGE_MS 150   /* > the ~107ms a full 16-deep FIFO represents, so the
+                               * age gate never fires during a normal congestion drain —
+                               * only on backlog stranded across a stream PAUSE (drain
+                               * runs on datagram arrival; no arrivals = frames sit),
+                               * which would otherwise replay as stale audio at the
+                               * head of the resumed stream */
 static long drain_fifo(struct ds5_link *L, int rawfd, int maxq, int *need_inval, const char **reason, const uint8_t *expect){
     long inj=0;
     while(L->fifo_count>0){
         int idx=L->fifo_head;
+        if(now_ms()-L->fifo[idx].ts>FIFO_MAX_AGE_MS){
+            L->fifo_head=(L->fifo_head+1)%FIFO_MAX; L->fifo_count--;
+            continue;                               /* stale pre-pause audio: drop */
+        }
         int r=inject_one(L,rawfd,L->fifo[idx].buf,L->fifo[idx].len,maxq,reason,expect);
         if(r==1){ L->fifo_head=(L->fifo_head+1)%FIFO_MAX; L->fifo_count--; inj++; continue; }
         if(r==-1){ *need_inval=1; fifo_clear(L); }  /* template gone -> drop stale audio */
@@ -618,7 +648,10 @@ static uint64_t g_cmd_dead_t = 0;    /* trip time; schedules the 60s recovery pr
 static uint16_t g_probe_op   = 0;    /* recovery probe awaiting Command Complete */
 static volatile long g_scan_ctr = 0; /* foreign scan re-enables countered (fight-rate telemetry) */
 #define CMD_PEND_MAX 8
-static struct { uint16_t op; uint64_t deadline; } g_pend[CMD_PEND_MAX];
+static struct { uint16_t op; uint16_t arg; uint64_t deadline; } g_pend[CMD_PEND_MAX];
+/* arg: command-specific context carried to the response handler. Used by
+ * OP_EXIT_SNIFF (the target ACL handle) so a Command Status answer can repair
+ * g_htab[].mode — Command Status carries no handle of its own. */
 static int g_pend_n = 0;             /* commands written but with no Command Complete seen yet */
 static void cmd_guard_trip(const char *why, unsigned detail){
     if(g_cmd_dead) return;
@@ -630,7 +663,7 @@ static void cmd_guard_trip(const char *why, unsigned detail){
 /* Single choke point for HCI commands: dead-gate, unacked-queue cap, EAGAIN
  * trip, pend bookkeeping. force=1 is reserved for the recovery probe.
  * Returns 0 = written (pend entry queued), -1 = not sent (caller retries). */
-static int cmd_send(const uint8_t *cmd, size_t len, uint16_t op, int force){
+static int cmd_send(const uint8_t *cmd, size_t len, uint16_t op, uint16_t arg, int force){
     if(g_rawfd<0) return -1;
     if(g_cmd_dead && !force) return -1;
     if(g_pend_n>=CMD_PEND_MAX) return -1;          /* >=16s of drain already queued: refuse */
@@ -645,6 +678,7 @@ static int cmd_send(const uint8_t *cmd, size_t len, uint16_t op, int force){
      * shrink the allowance as earlier entries complete while the survivor's age
      * keeps growing — the tail of a full burst would false-trip. */
     g_pend[g_pend_n].op=op;
+    g_pend[g_pend_n].arg=arg;
     g_pend[g_pend_n].deadline=now_ms()+6000ull+2000ull*(uint64_t)(g_pend_n+1);
     g_pend_n++;
     return 0;
@@ -664,7 +698,7 @@ static int send_link_policy(uint16_t handle){
         OP_WRITE_LINK_POLICY&0xff, OP_WRITE_LINK_POLICY>>8, 4,
         (uint8_t)(handle&0xff), (uint8_t)((handle>>8)&0x0f),
         LINK_POLICY_ACTIVE&0xff, LINK_POLICY_ACTIVE>>8 };
-    return cmd_send(cmd,sizeof cmd,OP_WRITE_LINK_POLICY,0);
+    return cmd_send(cmd,sizeof cmd,OP_WRITE_LINK_POLICY,handle,0);
 }
 
 /* Exit an ESTABLISHED sniff mode. Write_Link_Policy only rejects FUTURE mode
@@ -680,7 +714,7 @@ static int send_exit_sniff(uint16_t handle){
     uint8_t cmd[6]={ 0x01,
         OP_EXIT_SNIFF&0xff, OP_EXIT_SNIFF>>8, 2,
         (uint8_t)(handle&0xff), (uint8_t)((handle>>8)&0x0f) };
-    return cmd_send(cmd,sizeof cmd,OP_EXIT_SNIFF,0);
+    return cmd_send(cmd,sizeof cmd,OP_EXIT_SNIFF,handle,0);
 }
 
 /* BR/EDR scan control (Write_Scan_Enable). Measured live 2026-07-05: the
@@ -712,7 +746,7 @@ static void scan_reconcile(void){
     if(g_scan_tx && t-g_scan_tx<SCAN_MIN_GAP_MS) return;
     uint8_t cmd[5]={ 0x01,
         OP_WRITE_SCAN_ENABLE&0xff, OP_WRITE_SCAN_ENABLE>>8, 1, g_scan_want };
-    if(cmd_send(cmd,sizeof cmd,OP_WRITE_SCAN_ENABLE,0)==0){
+    if(cmd_send(cmd,sizeof cmd,OP_WRITE_SCAN_ENABLE,0,0)==0){
         g_scan_tx=t; g_scan_sent=g_scan_want;
         fprintf(stderr,"[txd] scan_enable=%u (%s)\n",g_scan_want,
                 g_scan_want?"restored":"off for session");
@@ -781,7 +815,8 @@ static void invalidate_stale_addr_files(void){
  * single-pad / untagged app reads it unchanged. Each link that has ever bound also
  * gets its per-address file, which the tagged app polls for its own controller. */
 static void publish_all(void){
-    struct { uint8_t valid; uint16_t nonce; uint8_t hdr[8]; uint8_t addr[6]; int has_addr; } s[MAX_LINKS];
+    struct { uint8_t valid; uint16_t nonce; uint8_t hdr[8]; uint8_t addr[6]; int has_addr;
+             uint8_t prev[6]; int prev_valid; } s[MAX_LINKS];
     pthread_mutex_lock(&g_pub_lock);
     pthread_mutex_lock(&g_lock);
     for(int i=0;i<MAX_LINKS;i++){
@@ -790,10 +825,25 @@ static void publish_all(void){
         memcpy(s[i].hdr,  g_links[i].hdr, 8);
         memcpy(s[i].addr, g_links[i].bound_addr, 6);
         s[i].has_addr = g_links[i].ever_bound;
+        s[i].prev_valid = g_links[i].prev_valid;
+        memcpy(s[i].prev, g_links[i].prev_addr, 6);
+        g_links[i].prev_valid = 0;   /* consumed: this publisher writes it below */
     }
     pthread_mutex_unlock(&g_lock);
     publish_record(g_tmpl_path, s[0].valid, s[0].nonce, s[0].valid ? s[0].hdr : NULL);
     for(int i=0;i<MAX_LINKS;i++){
+        /* Evicted identity first: valid=0 for a pad whose slot was taken over
+         * (see ds5_link.prev_addr), unless that pad meanwhile lives in another
+         * slot (then its own record below is authoritative). */
+        if(s[i].prev_valid){
+            int elsewhere=0;
+            for(int j=0;j<MAX_LINKS;j++)
+                if(s[j].has_addr && memcmp(s[j].addr,s[i].prev,6)==0){ elsewhere=1; break; }
+            if(!elsewhere){
+                char p[600]; per_addr_path(p,sizeof p,s[i].prev);
+                publish_record(p, 0, 0, NULL);
+            }
+        }
         if(!s[i].has_addr) continue;
         char p[600]; per_addr_path(p,sizeof p,s[i].addr);
         publish_record(p, s[i].valid, s[i].nonce, s[i].valid ? s[i].hdr : NULL);
@@ -1038,8 +1088,21 @@ static void handle_hci_event(const uint8_t *e, int el){
         uint16_t op=(uint16_t)(p[2]|(p[3]<<8));
         for(int i=0;i<g_pend_n;i++)
             if(g_pend[i].op==op){
+                uint16_t arg=g_pend[i].arg;
                 g_pend_n--;
                 memmove(&g_pend[i],&g_pend[i+1],(size_t)(g_pend_n-i)*sizeof g_pend[0]);
+                /* Exit_Sniff answered with an ERROR status (0x0c disallowed)
+                 * proves the link is NOT sniffed — the tracked mode was stale
+                 * (Mode Change or kernel connect lost on the monitor). Repair
+                 * it authoritatively, or the pin loop would re-send Exit_Sniff
+                 * every 3s forever: an active link never emits the Mode Change
+                 * that would clear mode, and the futile loop eats ~2/3 of the
+                 * 0.5/s kernel command drain for the rest of the session. */
+                if(op==OP_EXIT_SNIFF && p[0]!=0x00){
+                    pthread_mutex_lock(&g_lock);
+                    g_htab[arg&0x0fff].mode=0;
+                    pthread_mutex_unlock(&g_lock);
+                }
                 break;
             }
         return;
@@ -1075,6 +1138,10 @@ static void handle_hci_event(const uint8_t *e, int el){
         uint16_t hh=(uint16_t)((p[1]|(p[2]<<8))&0x0fff);
         pthread_mutex_lock(&g_lock);
         g_htab[hh].known=0;
+        g_htab[hh].mode=0;   /* a dead link is not sniffed: a later occupant of this
+                              * handle whose identity arrives via assert-learn/seed
+                              * (paths that never see a Mode Change) must not inherit
+                              * a stale mode==2 -> endless Exit_Sniff loop */
         struct ds5_link *L=link_by_handle(hh);
         if(L){ L->have=0; reason="bound handle disconnected"; }
         none_bound=!any_link_bound_locked();
@@ -1169,7 +1236,7 @@ static void seed_conn_list(void){
     for(int i=0;i<n;i++){
         uint16_t hh=req.ci[i].handle & 0x0fff;
         if(!g_htab[hh].known || memcmp(g_htab[hh].addr,req.ci[i].bdaddr.b,6)!=0){
-            memcpy(g_htab[hh].addr,req.ci[i].bdaddr.b,6); g_htab[hh].known=1; g_htab[hh].from_assert=0; /* kernel conn list */
+            memcpy(g_htab[hh].addr,req.ci[i].bdaddr.b,6); g_htab[hh].known=1; g_htab[hh].mode=0; g_htab[hh].from_assert=0; /* kernel conn list; mode unknown -> assume active */
             chg[nchg].hh=hh; memcpy(chg[nchg].a,req.ci[i].bdaddr.b,6); nchg++;
         }
     }
@@ -1304,7 +1371,7 @@ static void *capture_thread(void *arg){
             uint8_t mode=(g_scan_want!=0xff)?g_scan_want:2;
             uint8_t cmd[5]={ 0x01,
                 OP_WRITE_SCAN_ENABLE&0xff, OP_WRITE_SCAN_ENABLE>>8, 1, mode };
-            if(cmd_send(cmd,sizeof cmd,OP_WRITE_SCAN_ENABLE,1)==0){
+            if(cmd_send(cmd,sizeof cmd,OP_WRITE_SCAN_ENABLE,0,1)==0){
                 g_probe_op=OP_WRITE_SCAN_ENABLE;
                 g_scan_tx=now_ms(); g_scan_sent=mode;
             }
@@ -1400,6 +1467,9 @@ static void *capture_thread(void *arg){
             if(am>=0 && !assert_confirm(hh,g_assert[am].addr)) am=-1;
             if(am>=0){
                 memcpy(g_htab[hh].addr,g_assert[am].addr,6); g_htab[hh].known=1;
+                g_htab[hh].mode=0;          /* fresh identity, no Mode Change seen: never
+                                             * inherit a stale sniff flag from a previous
+                                             * occupant of this 12-bit handle */
                 g_htab[hh].from_assert=1;   /* jail-sourced identity: taint the htab entry
                                              * so this and any rebind off hh stay
                                              * assert_learned until a kernel connect (defence
@@ -1477,7 +1547,8 @@ static void process_report(struct ds5_link *L, int rawfd, const uint8_t *report,
                      * high-water forever under congestion, voiding the latency bound. */
                     while(L->fifo_count>=fdepth){ L->fifo_head=(L->fifo_head+1)%FIFO_MAX; L->fifo_count--; (*dropped)++; }
                     int tail=(L->fifo_head+L->fifo_count)%FIFO_MAX;
-                    memcpy(L->fifo[tail].buf,report,(size_t)n); L->fifo[tail].len=n; L->fifo_count++;
+                    memcpy(L->fifo[tail].buf,report,(size_t)n); L->fifo[tail].len=n;
+                    L->fifo[tail].ts=now_ms(); L->fifo_count++;
                     L->fifo_gen=snap_nonce;   /* held under THIS binding */
                 } else {
                     (*paced)++;              /* legacy latest-wins drop */

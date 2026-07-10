@@ -104,7 +104,7 @@ static void acl_log(ds5_acl_tx_t *t, const char *fmt, ...)
 }
 
 /* Readiness poller: the root daemon publishes a 16-byte record
- * ['C''T''M''T'][ver=1][flags][nonce LE16][acl_hdr 8]; flags bit0 = valid (the
+ * ['D''S''5''T'][ver=1][flags][nonce LE16][acl_hdr 8]; flags bit0 = valid (the
  * daemon has captured the current connection's template and can inject). We only
  * need the valid bit: ready=1 => forward to the daemon; ready=0 => seed via
  * hidraw so the daemon can capture the template from on-air traffic. */
