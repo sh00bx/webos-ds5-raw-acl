@@ -44,8 +44,20 @@ typedef void (*ds5_acl_log_fn)(void *ctx, const char *msg);
 /* Open an HCI_CHANNEL_RAW socket on hci_dev (0 on the TV) and start a monitor
  * thread that captures the on-air ACL/L2CAP framing of our own outgoing 0x36
  * reports. log_fn (may be NULL) receives diagnostic lines. Returns NULL on any
- * failure (caller stays on hidraw). */
-ds5_acl_tx_t *ds5_acl_tx_start(int hci_dev, ds5_acl_log_fn log_fn, void *log_ctx);
+ * failure (caller stays on hidraw).
+ *
+ * bt_mac (may be NULL/"") is the controller's Bluetooth address as a human string
+ * "aa:bb:cc:dd:ee:ff" (e.g. the hidraw HIDIOCGRAWUNIQ value). When present it makes
+ * this transport MULTI-CONTROLLER aware: each forwarded report is tagged with the
+ * target address so the root daemon routes it to that controller's own inject link
+ * (its own credit window / template), and readiness is tracked per-controller via a
+ * per-address template file. With bt_mac NULL/empty the transport uses the LEGACY
+ * untagged wire + shared readiness file — byte-for-byte the single-controller path,
+ * which the daemon routes to its primary link. A daemon too old to understand tags
+ * simply drops tagged datagrams (first byte is not an injectable report id), so the
+ * caller's hidraw fallback still covers it — no misinjection. */
+ds5_acl_tx_t *ds5_acl_tx_start(int hci_dev, const char *bt_mac,
+                               ds5_acl_log_fn log_fn, void *log_ctx);
 
 /* Inject one already-signed HID output report (report[0] = report id). See the
  * DS5_ACL_TX_* codes for the contract. */

@@ -15,6 +15,27 @@
 // round trip) — far below the ~10ms audio grid. The app falls back to its normal
 // hidraw write if the daemon is absent, so this never regresses.
 //
+// MULTI-CONTROLLER (2026-07-09) — co-op haptics parity for a 2nd DualSense:
+//   The single controller the daemon tracked was defence (e) below; a 2nd DS5's
+//   output fell back to the flow-controlled hidraw path (jittery). The state is
+//   now an ARRAY of independent inject links (struct ds5_link g_links[MAX_LINKS]),
+//   each with its OWN captured template, identity binding, credit window, tx-type
+//   ring, audio FIFO and gap telemetry — so every pad gets the same raw-ACL
+//   jitter-bypass. Routing:
+//     * Inbound reports: the app may TAG a datagram with the target BT address
+//       ([0xA5][0x5A][addr LSB-first][report]); the daemon injects it onto the
+//       link bound to that address. An UNTAGGED datagram (legacy / single-pad /
+//       USB) routes to the PRIMARY link (g_links[0]) — byte-for-byte the old path.
+//     * Capture: HID-output seen on a NEW handle binds a FREE link slot (was:
+//       "ignore any other handle"). Beyond MAX_LINKS slots a further device is
+//       ignored (never flip-flops a bound link).
+//     * Readiness: the base template file still tracks the primary link (a 1-pad /
+//       untagged app reads it unchanged); each bound link ALSO publishes a
+//       per-address file <tmpl>.<aabbccddeeff> that the tagged app polls.
+//   Cross-controller resources that are physically shared stay shared: the one
+//   radio's scan state (off while ANY link is bound), the HCI command path
+//   (rate-limited), and the handle->bdaddr table.
+//
 // HID-FD BROKER (Option A — app becomes jail-node-independent):
 //   The jail's /dev/hidraw* is a STATIC snapshot taken at jail-build (copynodall),
 //   so a controller hot-plugged afterwards onto a hidraw minor the snapshot never
@@ -28,24 +49,26 @@
 //   usage: ds5_txd [sock_path] [tmpl_path] [hidfd_sock_path]
 //
 // ALT-LATCH HARDENING (2026-06-27, review wf_a75a6ae7) — see ALTLATCH_AUDIT.md:
-//   Identity-bind the inject template to the DS5 bdaddr and refuse to inject onto a
+//   Identity-bind each inject template to the DS5 bdaddr and refuse to inject onto a
 //   handle we cannot prove is the DS5, so a flapped+reused 12-bit ACL handle can no
 //   longer carry our HID-output onto a foreign device (the Magic-Remote Left-Alt
 //   latch). Defences, in layers:
 //     (a) Fail CLOSED: a template is published VALID only once the bound handle's
 //         bdaddr is known (learned from HCI events or HCIGETCONNLIST). Until then the
 //         app keeps seeding via hidraw — safe, never blind-injects.
-//     (b) Event-driven invalidation: DISCONN / reassign-to-different-bdaddr of the
-//         bound handle drops the template instantly (covers BR/EDR + legacy & enhanced
-//         LE connect events).
+//     (b) Event-driven invalidation: DISCONN / reassign-to-different-bdaddr of a
+//         bound handle drops THAT link's template instantly (covers BR/EDR + legacy
+//         & enhanced LE connect events).
 //     (c) Idle backstop: evaluated every monitor wakeup (not only on recv-timeout),
-//         so it still fires under continuous unrelated BT traffic — the DS5 going
-//         silent after a flap invalidates within IDLE_INVALIDATE_MS even if the
-//         DISCONN event was dropped.
+//         so it still fires under continuous unrelated BT traffic — a DS5 going
+//         silent after a flap invalidates its link within IDLE_INVALIDATE_MS even if
+//         the DISCONN event was dropped.
 //     (d) Atomic check-and-inject: the bdaddr re-check and the write() happen under
 //         one lock, closing the check->inject TOCTOU.
-//     (e) Single-controller scope: only hci_dev=0 (the inject target) is tracked, so
-//         a second adapter's handle reuse can't pollute the table.
+//     (e) Bounded-controller scope: only hci_dev=0 (the inject target) is tracked,
+//         so a second ADAPTER's handle reuse can't pollute the table. (This is the
+//         controller/adapter index gate — NOT a one-DualSense limit; up to
+//         MAX_LINKS DualSenses on hci0 are tracked, each identity-bound.)
 //   Plus hardening the two IPC surfaces the audit named: the report datagram socket
 //   now requires SO_PEERCRED == jail uid, and the hid-fd broker only ever hands out
 //   an allowlisted game pad's hidraw (PAD_ALLOW; DS5, DS4, Xbox, Switch Pro,
@@ -68,6 +91,7 @@
 #include <sys/ioctl.h>
 #include <sys/prctl.h>
 #include <time.h>
+#include <dirent.h>
 
 #ifndef AF_BLUETOOTH
 #define AF_BLUETOOTH 31
@@ -86,23 +110,37 @@
 #define HCI_EV_CONN_COMPLETE    0x03
 #define HCI_EV_DISCONN_COMPLETE 0x05
 #define HCI_EV_CMD_COMPLETE     0x0e
+#define HCI_EV_CMD_STATUS       0x0f
 #define HCI_EV_NUM_COMP_PKTS    0x13
+#define HCI_EV_MODE_CHANGE      0x14
 #define HCI_EV_LE_META          0x3e
-#define STALL_RESET_MS          150   /* credits stopped this long -> resync g_outstanding */
+#define STALL_RESET_MS          150   /* credits stopped this long -> resync a link's outstanding */
 #define HCI_SUBEV_LE_CONN       0x01   /* LE Connection Complete                 */
 #define HCI_SUBEV_LE_ENH_CONN   0x0a   /* Enhanced LE Connection Complete (BT5)  */
 
-/* The single controller we inject on and therefore track. MUST equal the raw
- * inject socket's hci_dev (see main()). The MONITOR header's index field carries
+/* The single controller (adapter) we inject on and therefore track. MUST equal the
+ * raw inject socket's hci_dev (see main()). The MONITOR header's index field carries
  * the controller number (hci0 -> index 0); ignoring other indices stops a second
- * adapter's handle reuse from polluting g_htab or falsely invalidating the DS5. */
+ * adapter's handle reuse from polluting g_htab or falsely invalidating a link. */
 #define TARGET_HCI_INDEX    0
 
-#define IDLE_INVALIDATE_MS  1500   /* drop the template after this much DS5 silence */
+/* Number of concurrent DualSense inject links. 2 = couch co-op; the code is
+ * written to scale (bump this + rebuild). Each slot is an independent template +
+ * credit window; the physical radio airtime they share is the real ceiling. */
+#define MAX_LINKS           2
+
+#define IDLE_INVALIDATE_MS  1500   /* drop a link's template after this much DS5 silence */
 #define DRAIN_CAP           1024   /* max reports drained per poll wakeup (anti-flood) */
 #define JAIL_UID            6261   /* aurora jail uid — only sender allowed to inject */
 #define DS5_VID             0x054c /* Sony      } primary device; the broker additionally */
 #define DS5_PID             0x0ce6 /* DualSense } allows a small game-pad list, see PAD_ALLOW */
+
+/* Tagged-datagram framing: [ACL_TAG_M0][ACL_TAG_M1][addr 6, LSB-first][report].
+ * ACL_TAG_M0 (0xA5) is not a DS5 output report id (0x31/0x32/0x36), so a tagged
+ * datagram is told apart from a legacy untagged one by byte 0 alone. */
+#define ACL_TAG_M0          0xA5
+#define ACL_TAG_M1          0x5A
+#define ACL_TAG_LEN         8
 
 struct sockaddr_hci { unsigned short hci_family, hci_dev, hci_channel; };
 struct hci_mon_hdr  { uint16_t opcode, index, len; } __attribute__((packed));
@@ -128,19 +166,20 @@ static int injectable(uint8_t id){ return id==0x31 || id==0x32 || id==0x36; }
 static uint64_t now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return (uint64_t)ts.tv_sec*1000ull+ts.tv_nsec/1000000ull; }
 static uint64_t now_us(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return (uint64_t)ts.tv_sec*1000000ull+ts.tv_nsec/1000ull; }
 
-/* Max outstanding raw-ACL TX packets (a credit window). The inject path bypasses the
- * webOS BT one-outstanding metering: keeping it at 1 was the original jitter wall,
- * but removing the bound ENTIRELY lets our output backlog the controller's TX queue,
- * so the baseband spends its slots draining TX and polls the DS5 less -> its INPUT
- * reports gap (controller lag while the video/WiFi stays smooth). A small credit
- * window is the fix: pipeline enough packets to keep haptics tight, but never so many
- * that TX starves the input poll. It is INHERENTLY ADAPTIVE and prioritises input
- * without a static rate cap -- when the link is idle the controller confirms our
- * packets fast (NOCP), credits free immediately and we inject at full haptic rate;
- * only under contention (input/video needing airtime) do the credits lag, and output
- * automatically backs off to whatever bandwidth is left. Live-tunable via
- * /tmp/ds5_inject_maxq (>=1; a large value approximates the original unmetered path).
- * Cached ~1/sec.
+/* Max outstanding raw-ACL TX packets (a credit window), PER LINK. The inject path
+ * bypasses the webOS BT one-outstanding metering: keeping it at 1 was the original
+ * jitter wall, but removing the bound ENTIRELY lets our output backlog the
+ * controller's TX queue, so the baseband spends its slots draining TX and polls the
+ * DS5 less -> its INPUT reports gap (controller lag while the video/WiFi stays
+ * smooth). A small credit window is the fix: pipeline enough packets to keep
+ * haptics tight, but never so many that TX starves the input poll. It is INHERENTLY
+ * ADAPTIVE and prioritises input without a static rate cap -- when the link is idle
+ * the controller confirms our packets fast (NOCP), credits free immediately and we
+ * inject at full haptic rate; only under contention (input/video needing airtime)
+ * do the credits lag, and output automatically backs off to whatever bandwidth is
+ * left. Live-tunable via /tmp/ds5_inject_maxq (>=1; a large value approximates the
+ * original unmetered path). Cached ~1/sec. It is PER LINK, so two pads each keep an
+ * independent window; the shared radio airtime is what actually arbitrates them.
  *
  * Default 12 (measured 2026-07-04 in-game): the DS5 speaker/haptics 0x36 audio
  * stream is ~94 frames/s, and a window of 3 filled constantly under contention
@@ -162,7 +201,7 @@ static int inject_maxq(void){
 }
 
 /* Elastic FIFO for 0x36 speaker/haptics audio (OPT-IN, default 0 = disabled =
- * legacy drop-newest behavior). When the credit window is transiently full
+ * legacy drop-newest behavior). When a link's credit window is transiently full
  * (BT airtime lost to input/video), the drop-newest path punches a ~10ms hole
  * in the audio -> audible "Aussetzer". With a FIFO of depth N>0, a full-window
  * audio frame is instead HELD and injected as soon as a credit frees (drained
@@ -171,7 +210,7 @@ static int inject_maxq(void){
  * so input polling is unaffected -- the FIFO holds frames in OUR memory, not in
  * the controller. Sustained congestion overflows the FIFO -> drop-oldest, so
  * latency is bounded by N frames (~10.7ms each). Live-tunable via
- * /tmp/ds5_inject_fifo (0..FIFO_MAX). Cached ~1/sec. */
+ * /tmp/ds5_inject_fifo (0..FIFO_MAX). Cached ~1/sec. Each link has its own FIFO. */
 #define FIFO_MAX             16
 #define FIFO_ENTRY_MAX       256   /* audio 0x36 reports are well under this */
 #define INJECT_FIFO_DEFAULT  0
@@ -186,49 +225,82 @@ static int inject_fifo(void){
     return d;
 }
 
-/* g_lock guards the shared template/identity state below. It is held only for
- * short, NON-BLOCKING work — never across filesystem I/O. Publishing the template
- * record (which does open/write/rename and can block on the jail mount) is done by
- * publish_current() OUTSIDE g_lock, serialized by g_pub_lock, to keep the inject
- * loop's critical section bounded (no audio-grid stalls). */
+/* g_lock guards the per-link template/identity state below (the g_links[] fields
+ * noted "g_lock"). It is held only for short, NON-BLOCKING work — never across
+ * filesystem I/O. Publishing the template record (which does open/write/rename and
+ * can block on the jail mount) is done by publish_all() OUTSIDE g_lock, serialized
+ * by g_pub_lock, to keep the inject loop's critical section bounded (no audio-grid
+ * stalls). */
 static pthread_mutex_t g_lock     = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_pub_lock = PTHREAD_MUTEX_INITIALIZER;
-static uint8_t  g_hdr[8];
-static int      g_have = 0;
-static uint16_t g_nonce = 0;
-static uint64_t g_last_seen = 0;
-static int      g_outstanding = 0;   /* our raw-ACL TX packets queued in the controller but not yet
-                                        confirmed on-air (via HCI Number_Of_Completed_Packets). Bounded
-                                        by inject_maxq() so the baseband keeps polling the DS5 for INPUT. */
-static uint64_t g_last_nocp  = 0;    /* last NOCP time; stall backstop if credits stop returning */
 
-/* In-flight TX type ring (guarded by g_lock, same lifetime as g_outstanding).
- * NOCP credits do not say WHICH packet completed, so per-type accounting
- * approximates FIFO: injects push their type, each returned credit pops the
- * oldest. The rumble count this yields (g_rumble_fly) is what lets the credit
- * window be type-aware — rumble bounded by its OWN occupancy instead of the
- * total (a window full of audio must never read as "rumble is over budget").
- * The approximation errs OPEN under foreign kernel-path TX on the same handle
- * (their NOCPs pop our entries early -> g_rumble_fly under-counts -> rumble
- * slightly more permissive), which is the safe direction: it can relax the
- * rumble cap a little, never starve it. */
 #define TXRING 64
-static uint8_t g_txtype[TXRING];     /* 1 = rumble (0x31/0x32), 0 = audio (0x36) */
-static int g_tx_head=0, g_tx_cnt=0;
-static int g_rumble_fly=0;           /* believed-in-flight rumble packets */
-static void txwin_reset(void){ g_tx_head=0; g_tx_cnt=0; g_rumble_fly=0; }
-static void txwin_push(int rumble){
-    if(g_tx_cnt==TXRING){             /* overflow (huge tuned maxq): age out oldest */
-        if(g_txtype[g_tx_head]) g_rumble_fly--;
-        g_tx_head=(g_tx_head+1)%TXRING; g_tx_cnt--;
+
+/* ---- one inject link (per DualSense) --------------------------------------- *
+ * A link owns everything that is per-controller: its captured ACL template, its
+ * identity binding, its credit window + tx-type ring, its audio FIFO, and its gap
+ * telemetry. Fields are annotated with their guard/owner exactly as the single
+ * globals were before the array refactor:
+ *   [g_lock]  read/written from BOTH threads (capture + inject) -> under g_lock.
+ *   [inject]  touched only by the main (inject) poll loop -> no lock.
+ *   [cap]     touched only by the capture thread -> no lock.
+ *
+ * INVARIANT: have==1  =>  the template was bound with a KNOWN bdaddr
+ * (bound_known==1, bound_addr valid). Capture refuses to set have without a known
+ * bdaddr (fail closed), so every reader can trust bound_addr when have. */
+struct ds5_link {
+    /* template + identity (g_lock) */
+    uint8_t  hdr[8];         /* captured ACL/L2CAP header (handle @0..1, CID @6..7) */
+    int      have;           /* template valid -> safe to inject */
+    uint16_t nonce;          /* bumps each (re)bind; stamps FIFO entries as a generation */
+    uint64_t last_seen;      /* last on-air HID-output / NOCP for the bound handle */
+    uint16_t handle;         /* 12-bit ACL handle the template is bound to */
+    uint8_t  bound_addr[6];  /* device identity captured with the template (LSB-first) */
+    int      bound_known;    /* bound_addr is valid */
+    int      ever_bound;     /* bound_addr is meaningful for the per-address file path */
+    /* credit window (g_lock) */
+    int      outstanding;    /* our raw-ACL TX packets queued in the controller, not yet
+                                confirmed on-air (via HCI Number_Of_Completed_Packets) */
+    uint64_t last_nocp;      /* last NOCP time; stall backstop if credits stop returning */
+    /* in-flight TX type ring (g_lock, same lifetime as outstanding). NOCP credits do
+     * not say WHICH packet completed, so per-type accounting approximates FIFO:
+     * injects push their type, each returned credit pops the oldest. rumble_fly is
+     * what lets the credit window be type-aware — rumble bounded by its OWN occupancy
+     * instead of the total (a window full of audio must never read as "rumble over
+     * budget"). Errs OPEN under foreign kernel-path TX on the same handle (their
+     * NOCPs pop our entries early -> rumble_fly under-counts -> rumble slightly more
+     * permissive), which is the safe direction. */
+    uint8_t  txtype[TXRING]; /* 1 = rumble (0x31/0x32), 0 = audio (0x36) */
+    int      tx_head, tx_cnt;
+    int      rumble_fly;     /* believed-in-flight rumble packets */
+    /* audio elastic FIFO (inject) — see inject_fifo() */
+    struct { uint8_t buf[FIFO_ENTRY_MAX]; int len; } fifo[FIFO_MAX];
+    int      fifo_head, fifo_count;
+    uint16_t fifo_gen;       /* nonce the held backlog was queued under (stale-drop) */
+    /* per-link link-policy pin (cap) */
+    uint16_t policy_handle;  /* handle the last link-policy write was for */
+    uint64_t last_policy;
+    uint64_t last_unsniff;   /* last Exit_Sniff send (>=3s throttle, cap-only) */
+    /* per-link gap telemetry (inject) — the A/B acceptance signal */
+    long     gap30, gap50, gap80; /* NOCP-gap histogram 30-50/50-80/>=80ms */
+    uint64_t ep_start, gap_hi;    /* episode + sub-episode high-watermark state */
+    uint16_t tele_gen;            /* nonce the histogram counts; reset on rebind */
+};
+static struct ds5_link g_links[MAX_LINKS];
+
+static void txwin_reset(struct ds5_link *L){ L->tx_head=0; L->tx_cnt=0; L->rumble_fly=0; }
+static void txwin_push(struct ds5_link *L, int rumble){
+    if(L->tx_cnt==TXRING){            /* overflow (huge tuned maxq): age out oldest */
+        if(L->txtype[L->tx_head]) L->rumble_fly--;
+        L->tx_head=(L->tx_head+1)%TXRING; L->tx_cnt--;
     }
-    g_txtype[(g_tx_head+g_tx_cnt)%TXRING]=(uint8_t)(rumble?1:0);
-    g_tx_cnt++; if(rumble) g_rumble_fly++;
+    L->txtype[(L->tx_head+L->tx_cnt)%TXRING]=(uint8_t)(rumble?1:0);
+    L->tx_cnt++; if(rumble) L->rumble_fly++;
 }
-static void txwin_pop(int cnt){
-    while(cnt-->0 && g_tx_cnt>0){
-        if(g_txtype[g_tx_head]) g_rumble_fly--;
-        g_tx_head=(g_tx_head+1)%TXRING; g_tx_cnt--;
+static void txwin_pop(struct ds5_link *L, int cnt){
+    while(cnt-->0 && L->tx_cnt>0){
+        if(L->txtype[L->tx_head]) L->rumble_fly--;
+        L->tx_head=(L->tx_head+1)%TXRING; L->tx_cnt--;
     }
 }
 static const char *g_tmpl_path;
@@ -238,26 +310,106 @@ static const char *g_tmpl_path;
  * BT device (the Magic Remote) after the DS5 link flapped and its 12-bit ACL
  * handle was REUSED for another device: the kernel routes our inject purely by
  * that handle, write() still succeeds (handle valid, wrong device), so the old
- * EBADF guard never tripped. We close it by binding the template to the BD_ADDR it
- * was captured on (guaranteed to be the DS5 — only a DualSense receives an 0xA2
+ * EBADF guard never tripped. We close it by binding each template to the BD_ADDR it
+ * was captured on (guaranteed to be a DualSense — only a DualSense receives an 0xA2
  * 0x31/0x32/0x36 HID output) and refusing to inject the instant that handle's
  * bdaddr stops matching. handle->bdaddr is learned from CONN_COMPLETE /
  * (Enhanced)LE_CONN_COMPLETE / DISCONN_COMPLETE events on the SAME monitor socket
  * we already hold, seeded by HCIGETCONNLIST. No address is hardcoded — the binding
- * self-configures, so swapping controllers needs no rebuild.
- *
- * INVARIANT: g_have==1  =>  the live template was bound with a KNOWN bdaddr
- * (g_bound_known==1, g_bound_addr valid). Capture refuses to set g_have without a
- * known bdaddr (fail closed), so every reader can trust g_bound_addr when g_have. */
-struct htab_ent { uint8_t addr[6]; uint8_t known; };
+ * self-configures, so swapping controllers needs no rebuild. The table is SHARED
+ * across links (it is just the adapter's handle map). */
+struct htab_ent { uint8_t addr[6]; uint8_t known; uint8_t mode; };  /* mode: HCI Mode Change (0=active,2=sniff) */
 static struct htab_ent g_htab[4096];   /* indexed by handle & 0x0fff */
-static uint16_t g_handle = 0;          /* handle the live template is bound to */
-static uint8_t  g_bound_addr[6];       /* device identity captured with the template */
-static int      g_bound_known = 0;     /* g_bound_addr is valid (capture-time gate) */
 
-/* Inject one output report as a raw-ACL frame under g_lock, honoring the credit
- * window. Critical section identical in scope to the legacy inline path (one
- * bounded, non-blocking write; TOCTOU handle re-check under the same lock).
+/* ---- identity-assert ring (restart fix, 2026-07-10) ------------------------ *
+ * After a daemon RESTART with the DualSenses already connected there is no
+ * CONN_COMPLETE to learn handle->bdaddr from and webOS's HCIGETCONNLIST returns
+ * an EMPTY list (the vendor stack keeps connections out of the kernel's
+ * accounting), so every link stayed fail-closed and the app ran the whole
+ * session on the slow hidraw fallback ("restart latency"). The app now
+ * DUAL-SENDS while a pad is not ready: each report goes to hidraw (seeding, as
+ * before) AND as a tagged datagram asserting "these exact bytes belong to
+ * bdaddr X". When the capture thread then sees a DS5 HID-output (0xA2 +
+ * 0x31/0x32/0x36 — content-proven DualSense) on an UNKNOWN handle whose bytes
+ * exactly match a recent assertion (incl. the app's CRC32 tail + seq nibble),
+ * that handle is bound to the asserted address. The sender is SO_PEERCRED-gated
+ * to the jail uid, and identical bytes asserted for TWO different addresses are
+ * ambiguous -> no learn (wait for diverging content). Defences (a)-(e) hold: we
+ * still never inject onto a handle we cannot tie to a specific DualSense.
+ * Ring is g_lock-guarded (written by the inject thread, matched by capture). */
+#define ASSERT_RING   16
+#define ASSERT_TTL_MS 2000
+#define ASSERT_MAX    1024   /* must fit a full 0x36 audio report (app caches up to
+                              * 1024): in-session the ONLY reliably on-air seeds are
+                              * the audio frames — 0x31 rumble is usually dedup'd
+                              * away by the app — so audio must be assertable or a
+                              * restart mid-session never learns (found live: 256
+                              * skipped every 0x36 -> app stuck seeding forever). */
+static struct { uint8_t addr[6]; uint16_t len; uint64_t ts; uint8_t buf[ASSERT_MAX]; } g_assert[ASSERT_RING];
+static int g_assert_next = 0;          /* round-robin overwrite slot (g_lock) */
+
+/* Match an on-air report against the live assertions (g_lock held). Returns the
+ * entry index, -1 = none, -2 = ambiguous (same bytes asserted for two addrs). */
+static int assert_match(const uint8_t *rep, int rl){
+    int am=-1; uint64_t t=now_ms();
+    for(int i=0;i<ASSERT_RING;i++){
+        if(!g_assert[i].ts || t-g_assert[i].ts>ASSERT_TTL_MS) continue;
+        if(g_assert[i].len!=(uint16_t)rl || memcmp(g_assert[i].buf,rep,(size_t)rl)!=0) continue;
+        if(am>=0 && memcmp(g_assert[am].addr,g_assert[i].addr,6)!=0) return -2;
+        if(am<0) am=i;
+    }
+    return am;
+}
+
+/* ---- link lookup helpers (all assume g_lock held) -------------------------- */
+static struct ds5_link *link_by_handle(uint16_t hh){
+    for(int i=0;i<MAX_LINKS;i++)
+        if(g_links[i].have && g_links[i].handle==hh) return &g_links[i];
+    return NULL;
+}
+static struct ds5_link *link_by_addr(const uint8_t addr[6]){
+    for(int i=0;i<MAX_LINKS;i++)
+        if(g_links[i].have && g_links[i].bound_known &&
+           memcmp(g_links[i].bound_addr,addr,6)==0) return &g_links[i];
+    return NULL;
+}
+static struct ds5_link *free_slot(void){
+    for(int i=0;i<MAX_LINKS;i++) if(!g_links[i].have) return &g_links[i];
+    return NULL;
+}
+/* Bind-path slot choice: the live link for addr, else the slot that LAST held
+ * this addr (keeps pad<->slot identity stable across flaps, so per-binding
+ * telemetry and the idle sniff-pin stay attached to the right pad instead of
+ * churning when free_slot() hands a returning pad its neighbour's old slot),
+ * else any free slot. */
+static struct ds5_link *slot_for_addr(const uint8_t addr[6]){
+    struct ds5_link *L=link_by_addr(addr);
+    if(L) return L;
+    for(int i=0;i<MAX_LINKS;i++)
+        if(!g_links[i].have && g_links[i].ever_bound &&
+           memcmp(g_links[i].bound_addr,addr,6)==0) return &g_links[i];
+    return free_slot();
+}
+static int any_link_bound_locked(void){
+    for(int i=0;i<MAX_LINKS;i++) if(g_links[i].have) return 1;
+    return 0;
+}
+
+/* Bind (or rebind) link L to handle hh with the just-seen ACL header. Caller holds
+ * g_lock and has verified g_htab[hh].known. A rebind (same handle, new CID, or slot
+ * reuse) bumps the nonce so any FIFO audio held under the prior generation is
+ * dropped, and resets the credit window so we never inherit phantom credits (or
+ * per-type counts) from a flapped connection whose NOCPs were lost. */
+static void link_bind(struct ds5_link *L, const uint8_t hdr8[8], uint16_t hh){
+    memcpy(L->hdr,hdr8,8); L->handle=hh; memcpy(L->bound_addr,g_htab[hh].addr,6);
+    L->bound_known=1; L->have=1; L->ever_bound=1; L->nonce++;
+    L->outstanding=0; L->last_nocp=now_ms(); txwin_reset(L);
+    L->last_seen=now_ms();
+}
+
+/* Inject one output report as a raw-ACL frame onto link L under g_lock, honoring
+ * the credit window. Critical section identical in scope to the legacy inline path
+ * (one bounded, non-blocking write; TOCTOU handle re-check under the same lock).
  *
  * The window is TYPE-AWARE, derived from rep[0]:
  *   audio (0x36):        may fill maxq-1 credits. The last credit is RESERVED so
@@ -269,52 +421,59 @@ static int      g_bound_known = 0;     /* g_bound_addr is valid (capture-time ga
  *                        contention lasts: the pad keeps buzzing with the last
  *                        applied intensity.
  *   rumble (0x31/0x32):  bounded by the full window AND by its OWN in-flight
- *                        count (g_rumble_fly) at maxq/2 — counting rumble by
+ *                        count (rumble_fly) at maxq/2 — counting rumble by
  *                        its own occupancy, not the total, is what makes the
  *                        "rumble may only fill half the window" contract real.
  *
  * Stall backstop: window full with no NOCP for STALL_RESET_MS means the credits
  * are presumed lost (a flap ate the NOCPs) -> resync to empty AND RE-ARM
- * g_last_nocp. Without the re-arm a long radio blackout (NOCPs delayed, not
+ * last_nocp. Without the re-arm a long radio blackout (NOCPs delayed, not
  * lost) keeps the stall condition true, so the window would reset every time it
  * refills (~130ms at audio rate) — i.e. unbounded injection into the controller
  * TX queue for the whole blackout, exactly the input-poll starvation the window
  * exists to prevent. Audio-only: a rumble call operates at half occupancy and
  * must never zero the shared accounting.
  *
- * Returns:  1 = injected (g_outstanding++),
+ * `expect` (may be NULL) is the target bdaddr the caller ROUTED to (a tagged send).
+ * The link is resolved by address, then g_lock is dropped and re-taken here, so a
+ * capture-thread rebind of this slot to a DIFFERENT DualSense could slip into that
+ * window; re-checking L->bound_addr against `expect` under THIS lock closes it — a
+ * mismatch means the slot moved, so we skip (return -2) rather than buzz the wrong
+ * pad. NULL (legacy untagged -> primary link) skips the check, unchanged.
+ *
+ * Returns:  1 = injected (L->outstanding++),
  *           0 = credit window full (caller may queue or drop),
  *          -1 = template invalidated (foreign handle / EBADF; *reason set, caller
- *               must publish_current() + log),
- *          -2 = no live template (g_have==0). */
-static int inject_one(int rawfd, const uint8_t *rep, int n, int maxq, const char **reason){
+ *               must publish_all() + log),
+ *          -2 = no live template (L->have==0) or the routed slot was rebound. */
+static int inject_one(struct ds5_link *L, int rawfd, const uint8_t *rep, int n, int maxq, const char **reason, const uint8_t *expect){
     uint8_t frame[1+8+1+ACL_MAX_REPORT];
     int r=-2;
     int is_rumble=(rep[0]!=0x36);
     int lim  = is_rumble ? maxq : (maxq>1 ? maxq-1 : 1);   /* audio leaves 1 credit reserved */
     int rcap = (maxq/2)>0 ? (maxq/2) : 1;
     pthread_mutex_lock(&g_lock);
-    if(g_have){
-        uint16_t hh=(uint16_t)((g_hdr[0]|(g_hdr[1]<<8))&0x0fff);
-        if(g_htab[hh].known && memcmp(g_htab[hh].addr,g_bound_addr,6)!=0){
-            g_have=0; *reason="bound handle now foreign -> template INVALID"; r=-1;
+    if(L->have && (!expect || memcmp(L->bound_addr,expect,6)==0)){
+        uint16_t hh=(uint16_t)((L->hdr[0]|(L->hdr[1]<<8))&0x0fff);
+        if(g_htab[hh].known && memcmp(g_htab[hh].addr,L->bound_addr,6)!=0){
+            L->have=0; *reason="bound handle now foreign -> template INVALID"; r=-1;
         } else {
-            if(!is_rumble && g_outstanding>=lim &&
-               g_last_nocp && now_ms()-g_last_nocp>STALL_RESET_MS){
-                g_outstanding=0; txwin_reset();   /* credits presumed lost -> resync */
-                g_last_nocp=now_ms();             /* re-arm: at most one resync per STALL_RESET_MS */
+            if(!is_rumble && L->outstanding>=lim &&
+               L->last_nocp && now_ms()-L->last_nocp>STALL_RESET_MS){
+                L->outstanding=0; txwin_reset(L);   /* credits presumed lost -> resync */
+                L->last_nocp=now_ms();              /* re-arm: at most one resync per STALL_RESET_MS */
             }
-            if(g_outstanding>=lim || (is_rumble && g_rumble_fly>=rcap)){
+            if(L->outstanding>=lim || (is_rumble && L->rumble_fly>=rcap)){
                 r=0;
             } else {
                 uint16_t l2=(uint16_t)(1+n), acl=(uint16_t)(4+l2);
-                frame[0]=HCI_ACLDATA_PKT; memcpy(frame+1,g_hdr,8);
+                frame[0]=HCI_ACLDATA_PKT; memcpy(frame+1,L->hdr,8);
                 frame[3]=(uint8_t)(acl&0xff); frame[4]=(uint8_t)(acl>>8);
                 frame[5]=(uint8_t)(l2&0xff);  frame[6]=(uint8_t)(l2>>8);
                 frame[9]=0xA2; memcpy(frame+10,rep,n);
                 ssize_t wr=write(rawfd,frame,10+n);
-                if(wr==(ssize_t)(10+n)){ r=1; g_outstanding++; txwin_push(is_rumble); }
-                else if(wr<0 && errno==EBADF){ g_have=0; *reason="inject EBADF -> template INVALID (reconnect)"; r=-1; }
+                if(wr==(ssize_t)(10+n)){ r=1; L->outstanding++; txwin_push(L,is_rumble); }
+                else if(wr<0 && errno==EBADF){ L->have=0; *reason="inject EBADF -> template INVALID (reconnect)"; r=-1; }
                 else r=0;
             }
         }
@@ -323,30 +482,27 @@ static int inject_one(int rawfd, const uint8_t *rep, int n, int maxq, const char
     return r;
 }
 
-/* Audio-only elastic FIFO (single-threaded: touched only by the main poll loop).
- * g_fifo_gen stamps the backlog with the template nonce it was queued under, so
- * frames held across an invalidate->rebind (a new session, new nonce) are
+/* Audio-only elastic FIFO drain (single-threaded per link: touched only by the main
+ * poll loop). fifo_gen stamps the backlog with the template nonce it was queued
+ * under, so frames held across an invalidate->rebind (new session, new nonce) are
  * recognized as stale and dropped instead of being injected as a burst of
  * last-session audio at the head of the new one. */
-static struct { uint8_t buf[FIFO_ENTRY_MAX]; int len; } g_fifo[FIFO_MAX];
-static int g_fifo_head=0, g_fifo_count=0;
-static uint16_t g_fifo_gen=0;
-static void fifo_clear(void){ g_fifo_head=0; g_fifo_count=0; }
+static void fifo_clear(struct ds5_link *L){ L->fifo_head=0; L->fifo_count=0; }
 
-/* Drain the audio backlog oldest-first while credits allow (main thread only).
+/* Drain a link's audio backlog oldest-first while credits allow (main thread only).
  * Runs even when the FIFO tunable is 0 so disabling it flushes a residual
  * backlog instead of stranding it. Returns the number injected; on template
  * invalidation sets need_inval + reason (caller publishes) and drops the stale
  * backlog. */
-static long drain_fifo(int rawfd, int maxq, int *need_inval, const char **reason){
+static long drain_fifo(struct ds5_link *L, int rawfd, int maxq, int *need_inval, const char **reason, const uint8_t *expect){
     long inj=0;
-    while(g_fifo_count>0){
-        int idx=g_fifo_head;
-        int r=inject_one(rawfd,g_fifo[idx].buf,g_fifo[idx].len,maxq,reason);
-        if(r==1){ g_fifo_head=(g_fifo_head+1)%FIFO_MAX; g_fifo_count--; inj++; continue; }
-        if(r==-1){ *need_inval=1; fifo_clear(); }  /* template gone -> drop stale audio */
-        else if(r==-2) fifo_clear();               /* no template: backlog is already stale */
-        break;                                     /* credits full (0) -> retry next wakeup */
+    while(L->fifo_count>0){
+        int idx=L->fifo_head;
+        int r=inject_one(L,rawfd,L->fifo[idx].buf,L->fifo[idx].len,maxq,reason,expect);
+        if(r==1){ L->fifo_head=(L->fifo_head+1)%FIFO_MAX; L->fifo_count--; inj++; continue; }
+        if(r==-1){ *need_inval=1; fifo_clear(L); }  /* template gone -> drop stale audio */
+        else if(r==-2) fifo_clear(L);               /* no template: backlog is already stale */
+        break;                                      /* credits full (0) -> retry next wakeup */
     }
     return inj;
 }
@@ -361,13 +517,13 @@ static int      g_rawfd = -1;          /* main's raw HCI socket, shared for link
  * faster than that for long enough and the socket sndbuf overflows (~30min at
  * the old 1Hz scan war) -> permanent EAGAIN and our scan-offs arrive minutes
  * late (the night's "firmware wedge" + "dropouts got worse", both really this
- * arithmetic). Rules:
+ * arithmetic). The command path is SHARED across links (one adapter). Rules:
  *  (a) steady-state command rate stays well under the 0.5/s drain (10s
- *      link-policy refresh + >=3s-ratelimited scan sends <= 0.43/s typical);
- *      BURSTS (template flap = invalidate+rebind = up to 3 commands) are
- *      absorbed by a hard unacked-queue cap (CMD_PEND_MAX): once that many
- *      commands await their Command Complete, further sends are refused and
- *      the reconcilers simply retry later — the sndbuf can never build more
+ *      link-policy refresh PER LINK + >=3s-ratelimited scan sends <= 0.43/s
+ *      typical for 2 links); BURSTS (template flap = invalidate+rebind = up to 3
+ *      commands) are absorbed by a hard unacked-queue cap (CMD_PEND_MAX): once
+ *      that many commands await their Command Complete, further sends are refused
+ *      and the reconcilers simply retry later — the sndbuf can never build more
  *      than ~CMD_PEND_MAX*2s of backlog no matter how hard the session flaps.
  *  (b) every sent command is queued with its timestamp and watched for a
  *      Command Complete on the MONITOR socket (sees responses even in
@@ -387,7 +543,6 @@ static volatile int g_cmd_dead = 0;
 static uint64_t g_cmd_dead_t = 0;    /* trip time; schedules the 60s recovery probes */
 static uint16_t g_probe_op   = 0;    /* recovery probe awaiting Command Complete */
 static volatile long g_scan_ctr = 0; /* foreign scan re-enables countered (fight-rate telemetry) */
-static long g_gap30=0, g_gap50=0, g_gap80=0; /* NOCP-gap histogram 30-50/50-80/>=80ms (main thread) */
 #define CMD_PEND_MAX 8
 static struct { uint16_t op; uint64_t deadline; } g_pend[CMD_PEND_MAX];
 static int g_pend_n = 0;             /* commands written but with no Command Complete seen yet */
@@ -421,13 +576,13 @@ static int cmd_send(const uint8_t *cmd, size_t len, uint16_t op, int force){
     return 0;
 }
 
-/* Disable sniff/hold/park on the DS5 ACL link (keep role-switch). Measured live
+/* Disable sniff/hold/park on a DS5 ACL link (keep role-switch). Measured live
  * 2026-07-02: the stack lets the link fall into SNIFF (interval 124 slots =
  * 77.5 ms) every ~30 s; input collapses to ~13 Hz for ~0.5 s until the app's
  * 500 ms stopSniff poll recovers it — the user-visible input dropouts. Clearing
  * the sniff policy bit makes the LMP layer reject sniff requests from EITHER
  * side, so the mode never changes. Per-packet write on a SOCK_RAW datagram
- * socket is atomic, so racing with main's ACL injects is safe. */
+ * socket is atomic, so racing with main's ACL injects is safe. Pinned per link. */
 #define OP_WRITE_LINK_POLICY 0x080d
 #define LINK_POLICY_ACTIVE   0x0001    /* role switch only; sniff/hold/park off */
 static int send_link_policy(uint16_t handle){
@@ -438,13 +593,29 @@ static int send_link_policy(uint16_t handle){
     return cmd_send(cmd,sizeof cmd,OP_WRITE_LINK_POLICY,0);
 }
 
+/* Exit an ESTABLISHED sniff mode. Write_Link_Policy only rejects FUTURE mode
+ * requests — a link already sitting in sniff when the pin lands (a pad that
+ * connected before the session and idled >30s) stays in sniff and keeps taxing
+ * the active pad's airtime. Proven live 2026-07-10: Exit_Sniff on an active-mode
+ * link answers Command Status 0x0c (disallowed), on a sniffed one it exits and
+ * emits a Mode Change we track in g_htab[].mode. NOTE Exit_Sniff_Mode is
+ * answered by Command STATUS (not Complete) — handle_hci_event pops pend on
+ * both, or the cmdguard would false-trip DEAD on every exit. */
+#define OP_EXIT_SNIFF 0x0804
+static int send_exit_sniff(uint16_t handle){
+    uint8_t cmd[6]={ 0x01,
+        OP_EXIT_SNIFF&0xff, OP_EXIT_SNIFF>>8, 2,
+        (uint8_t)(handle&0xff), (uint8_t)((handle>>8)&0x0f) };
+    return cmd_send(cmd,sizeof cmd,OP_EXIT_SNIFF,0);
+}
+
 /* BR/EDR scan control (Write_Scan_Enable). Measured live 2026-07-05: the
  * controller's periodic page/inquiry scan blocks the DS5 ACL link for
  * 86-234ms on a ~1.28s grid (EPISODE detector) — audible speaker dropouts and
  * the input hiccups. Scan-off while a template is bound removed ~8x of the
  * blackouts and made input clean in the live A/B. Scan mode 2 (connectable,
- * not discoverable) is restored when the template goes invalid so devices can
- * (re)connect outside sessions.
+ * not discoverable) is restored when NO link is bound so devices can (re)connect
+ * outside sessions. Scan is a SHARED radio property: off while ANY link is bound.
  *
  * Implemented as a WANT/SENT reconciler instead of scattered direct sends:
  * every state change (bind, invalidate — from ANY thread via g_scan_restore —
@@ -474,35 +645,85 @@ static void scan_reconcile(void){
     }
 }
 
-/* Publish the 16-byte readiness/template record atomically (temp+rename). */
-static void publish(uint8_t flags, uint16_t nonce, const uint8_t hdr[8]){
+/* Write the 16-byte readiness/template record atomically (temp+rename) to `path`. */
+static void publish_record(const char *path, uint8_t valid, uint16_t nonce, const uint8_t hdr[8]){
     uint8_t rec[16];
-    rec[0]='D';rec[1]='S';rec[2]='5';rec[3]='T';rec[4]=1;rec[5]=flags;
+    rec[0]='D';rec[1]='S';rec[2]='5';rec[3]='T';rec[4]=1;rec[5]=valid?1:0;
     rec[6]=(uint8_t)(nonce&0xff); rec[7]=(uint8_t)(nonce>>8);
     if(hdr) memcpy(rec+8,hdr,8); else memset(rec+8,0,8);
-    char tmp[600]; snprintf(tmp,sizeof tmp,"%s.tmp",g_tmpl_path);
+    char tmp[600]; snprintf(tmp,sizeof tmp,"%s.tmp",path);
     int fd=open(tmp,O_WRONLY|O_CREAT|O_TRUNC,0644);
     if(fd<0) return;
     ssize_t w=write(fd,rec,16); fchmod(fd,0644); close(fd);
-    if(w==16) { if(rename(tmp,g_tmpl_path)<0) unlink(tmp); } else unlink(tmp);
+    if(w==16) { if(rename(tmp,path)<0) unlink(tmp); } else unlink(tmp);
 }
 
-/* Publish whatever the CURRENT template state is. g_pub_lock serializes publishers;
- * the g_lock snapshot is taken INSIDE the g_pub_lock section so the last publisher to
- * acquire g_pub_lock reads the latest committed state and writes it LAST — the file
- * therefore converges to the current state regardless of the order two threads call
- * this (snapshotting outside g_pub_lock would let an earlier snapshot's write land
- * last and leave a stale record). Lock order is always g_pub_lock -> g_lock;
- * publish_current is the only place that nests them and every caller has already
- * released g_lock before calling, so there is no inversion. File I/O (in publish())
- * still never runs under g_lock. MUST be called WITHOUT g_lock held. */
-static void publish_current(void){
-    uint8_t hdr[8]; uint16_t nonce; int have;
+/* Build the per-address readiness filename "<base>.aabbccddeeff" (human MAC order,
+ * lowercase, no colons) from an LSB-first bound_addr. */
+static void per_addr_path(char *out, size_t n, const uint8_t addr[6]){
+    snprintf(out,n,"%s.%02x%02x%02x%02x%02x%02x",g_tmpl_path,
+             addr[5],addr[4],addr[3],addr[2],addr[1],addr[0]);
+}
+
+/* Startup hygiene: per-address readiness files from a PREVIOUS daemon run survive
+ * in the jail tmp. One still saying valid=1 makes that tagged client keep
+ * forwarding datagrams (which we must drop — no link) and never fall back to
+ * hidraw seeding, so nothing ever goes on-air to capture OR assert-learn from:
+ * the pad's output would be dead until a reconnect. Invalidate every
+ * "<tmpl-base>.<12 lowercase hex>" sibling before serving. */
+static void invalidate_stale_addr_files(void){
+    char dir[600]; snprintf(dir,sizeof dir,"%s",g_tmpl_path);
+    char *slash=strrchr(dir,'/');
+    if(!slash) return;
+    *slash='\0';
+    const char *base=slash+1; size_t blen=strlen(base);
+    DIR *dp=opendir(dir);
+    if(!dp) return;
+    struct dirent *e;
+    while((e=readdir(dp))){
+        const char *nm=e->d_name;
+        if(strncmp(nm,base,blen)!=0 || nm[blen]!='.') continue;
+        const char *hex=nm+blen+1; int hl=0, ok=1;
+        for(;hex[hl];hl++)
+            if(!((hex[hl]>='0'&&hex[hl]<='9')||(hex[hl]>='a'&&hex[hl]<='f'))){ ok=0; break; }
+        if(!ok || hl!=12) continue;
+        char p[900]; snprintf(p,sizeof p,"%s/%s",dir,nm);
+        publish_record(p,0,0,NULL);
+        fprintf(stderr,"[txd] stale per-address readiness %s -> invalidated\n",nm);
+    }
+    closedir(dp);
+}
+
+/* Publish the CURRENT readiness state of every link. g_pub_lock serializes
+ * publishers; the g_lock snapshot is taken INSIDE the g_pub_lock section so the
+ * last publisher to acquire g_pub_lock reads the latest committed state and writes
+ * it LAST — the files therefore converge to the current state regardless of the
+ * order two threads call this. Lock order is always g_pub_lock -> g_lock; this is
+ * the only place that nests them and every caller has already released g_lock
+ * before calling, so there is no inversion. File I/O (in publish_record()) still
+ * never runs under g_lock. MUST be called WITHOUT g_lock held.
+ *
+ * The BASE file (g_tmpl_path) tracks the PRIMARY link (g_links[0]) so a legacy
+ * single-pad / untagged app reads it unchanged. Each link that has ever bound also
+ * gets its per-address file, which the tagged app polls for its own controller. */
+static void publish_all(void){
+    struct { uint8_t valid; uint16_t nonce; uint8_t hdr[8]; uint8_t addr[6]; int has_addr; } s[MAX_LINKS];
     pthread_mutex_lock(&g_pub_lock);
     pthread_mutex_lock(&g_lock);
-    have = g_have; nonce = g_nonce; memcpy(hdr, g_hdr, 8);
+    for(int i=0;i<MAX_LINKS;i++){
+        s[i].valid   = g_links[i].have ? 1 : 0;
+        s[i].nonce   = g_links[i].nonce;
+        memcpy(s[i].hdr,  g_links[i].hdr, 8);
+        memcpy(s[i].addr, g_links[i].bound_addr, 6);
+        s[i].has_addr = g_links[i].ever_bound;
+    }
     pthread_mutex_unlock(&g_lock);
-    publish(have ? 1 : 0, nonce, have ? hdr : NULL);
+    publish_record(g_tmpl_path, s[0].valid, s[0].nonce, s[0].valid ? s[0].hdr : NULL);
+    for(int i=0;i<MAX_LINKS;i++){
+        if(!s[i].has_addr) continue;
+        char p[600]; per_addr_path(p,sizeof p,s[i].addr);
+        publish_record(p, s[i].valid, s[i].nonce, s[i].valid ? s[i].hdr : NULL);
+    }
     pthread_mutex_unlock(&g_pub_lock);
 }
 
@@ -513,10 +734,10 @@ static void publish_current(void){
  * kernel (we hold the fd) but the PATH now resolves into the new, empty mount —
  * so the jailed app's sendto()/connect() by path gets ENOENT and silently falls
  * back to the flow-controlled hidraw write → DS5 audio/haptic dropouts. (The
- * tmpl FILE survives only because publish() re-open(O_CREAT)s it into whatever
- * mount is on top.) We give the sockets the same treatment: watch the mount
- * table via poll() on /proc/self/mountinfo — the kernel wakes us EXACTLY on a
- * mount/unmount, no time-based polling — and re-bind the node into the current
+ * tmpl FILE survives only because publish_record() re-open(O_CREAT)s it into
+ * whatever mount is on top.) We give the sockets the same treatment: watch the
+ * mount table via poll() on /proc/self/mountinfo — the kernel wakes us EXACTLY on
+ * a mount/unmount, no time-based polling — and re-bind the node into the current
  * top mount whenever the path stops resolving to a socket. If the watch fd can't
  * be opened we degrade to a 500ms time-based poll (never lose self-heal). */
 
@@ -579,7 +800,7 @@ static int bind_unix_stream(const char *path){
  * Hand the jailed app an open fd for a /dev/hidrawN node its static jail /dev
  * never received. One request per connection: the app writes the device path it
  * wants (newline-terminated); we authenticate the peer, validate the path, confirm
- * the node is the DS5's own hidraw, open it, and reply with a 1-byte status
+ * the node is a DS5's own hidraw, open it, and reply with a 1-byte status
  * ('O'=ok / 'E'=error) plus — on success — the open fd as SCM_RIGHTS ancillary. */
 
 /* Defence in depth: only ever open /dev/hidraw<digits>, never an arbitrary path. */
@@ -715,13 +936,13 @@ static void *broker_thread(void *arg){
 }
 
 /* Parse one HCI event packet off the MONITOR stream and maintain the
- * handle->bdaddr table; invalidate the live template if the bound handle drops or
- * is reassigned to a different device. Called from capture_thread WITHOUT g_lock
+ * handle->bdaddr table; invalidate a bound link if its handle drops or is
+ * reassigned to a different device. Called from capture_thread WITHOUT g_lock
  * held (it takes g_lock for the shared state, then publishes outside it). */
 static void handle_hci_event(const uint8_t *e, int el){
     if(el < 2) return;
     uint8_t code=e[0]; const uint8_t *p=e+2; int pl=el-2;   /* skip [code][param_len] */
-    const char *reason=NULL;
+    const char *reason=NULL; int none_bound=0;
     if(code==HCI_EV_CMD_COMPLETE && pl>=3){                 /* ncmd,opcode(2),status... */
         uint16_t op=(uint16_t)(p[1]|(p[2]<<8));
         for(int i=0;i<g_pend_n;i++)                         /* pop the oldest matching pend */
@@ -736,19 +957,44 @@ static void handle_hci_event(const uint8_t *e, int el){
         }
         return;
     }
+    if(code==HCI_EV_CMD_STATUS && pl>=4){                   /* status,ncmd,opcode(2) */
+        /* Some commands (Exit_Sniff_Mode) are answered by Command STATUS only —
+         * pop their pend entry here or the cmdguard would count them unanswered
+         * and false-trip DEAD 6s after every exit-sniff. */
+        uint16_t op=(uint16_t)(p[2]|(p[3]<<8));
+        for(int i=0;i<g_pend_n;i++)
+            if(g_pend[i].op==op){
+                g_pend_n--;
+                memmove(&g_pend[i],&g_pend[i+1],(size_t)(g_pend_n-i)*sizeof g_pend[0]);
+                break;
+            }
+        return;
+    }
+    if(code==HCI_EV_MODE_CHANGE && pl>=6){                  /* status,handle(2),mode,interval(2) */
+        if(p[0]!=0x00) return;
+        uint16_t hh=(uint16_t)((p[1]|(p[2]<<8))&0x0fff);
+        pthread_mutex_lock(&g_lock);
+        g_htab[hh].mode=p[3];
+        pthread_mutex_unlock(&g_lock);
+        return;                                             /* mode never affects validity */
+    }
     if(code==HCI_EV_CONN_COMPLETE && pl>=9){                /* status,handle(2),bdaddr(6),... */
         if(p[0]!=0x00) return;
         uint16_t hh=(uint16_t)((p[1]|(p[2]<<8))&0x0fff);
         pthread_mutex_lock(&g_lock);
-        memcpy(g_htab[hh].addr,p+3,6); g_htab[hh].known=1;
-        if(g_have && hh==g_handle && memcmp(p+3,g_bound_addr,6)!=0){ g_have=0; reason="bound handle reassigned (BR/EDR)"; }
+        memcpy(g_htab[hh].addr,p+3,6); g_htab[hh].known=1; g_htab[hh].mode=0; /* fresh link = active */
+        struct ds5_link *L=link_by_handle(hh);
+        if(L && memcmp(p+3,L->bound_addr,6)!=0){ L->have=0; reason="bound handle reassigned (BR/EDR)"; }
+        none_bound=!any_link_bound_locked();
         pthread_mutex_unlock(&g_lock);
     } else if(code==HCI_EV_DISCONN_COMPLETE && pl>=4){      /* status,handle(2),reason */
         if(p[0]!=0x00) return;
         uint16_t hh=(uint16_t)((p[1]|(p[2]<<8))&0x0fff);
         pthread_mutex_lock(&g_lock);
         g_htab[hh].known=0;
-        if(g_have && hh==g_handle){ g_have=0; reason="bound handle disconnected"; }
+        struct ds5_link *L=link_by_handle(hh);
+        if(L){ L->have=0; reason="bound handle disconnected"; }
+        none_bound=!any_link_bound_locked();
         pthread_mutex_unlock(&g_lock);
     } else if(code==HCI_EV_LE_META && pl>=12){              /* subev,status,handle(2),role,atype,addr(6) */
         /* Legacy (0x01) and Enhanced (0x0A) LE Connection Complete share the same
@@ -756,45 +1002,47 @@ static void handle_hci_event(const uint8_t *e, int el){
         if((p[0]!=HCI_SUBEV_LE_CONN && p[0]!=HCI_SUBEV_LE_ENH_CONN) || p[1]!=0x00) return;
         uint16_t hh=(uint16_t)((p[2]|(p[3]<<8))&0x0fff);
         pthread_mutex_lock(&g_lock);
-        memcpy(g_htab[hh].addr,p+6,6); g_htab[hh].known=1;
-        if(g_have && hh==g_handle && memcmp(p+6,g_bound_addr,6)!=0){ g_have=0; reason="bound handle reassigned (LE)"; }
+        memcpy(g_htab[hh].addr,p+6,6); g_htab[hh].known=1; g_htab[hh].mode=0;
+        struct ds5_link *L=link_by_handle(hh);
+        if(L && memcmp(p+6,L->bound_addr,6)!=0){ L->have=0; reason="bound handle reassigned (LE)"; }
+        none_bound=!any_link_bound_locked();
         pthread_mutex_unlock(&g_lock);
     } else if(code==HCI_EV_NUM_COMP_PKTS && pl>=1){        /* TX credits returned: free the outstanding window */
         int nh=p[0];
         if(pl < 1+nh*4) return;
         pthread_mutex_lock(&g_lock);
-        if(g_have){
-            uint16_t bh=(uint16_t)((g_hdr[0]|(g_hdr[1]<<8))&0x0fff);
-            for(int i=0;i<nh;i++){
-                uint16_t hh=(uint16_t)((p[1+i*4]|(p[2+i*4]<<8))&0x0fff);
-                if(hh==bh){
-                    int cnt=(int)(p[3+i*4]|(p[4+i*4]<<8));
-                    g_outstanding-=cnt; if(g_outstanding<0) g_outstanding=0;
-                    txwin_pop(cnt);   /* FIFO-approximate the per-type in-flight counts */
-                    /* Refresh the stall timestamp ONLY for OUR handle's completions:
-                     * a global refresh would let any other device's NOCP chatter
-                     * (Magic Remote etc.) suppress the 150ms backstop exactly when
-                     * our credits are the ones wedged. */
-                    g_last_nocp=now_ms();
-                    /* NOCP for the bound handle also proves the LINK is alive:
-                     * the controller is completing OUR injections. Without this,
-                     * g_last_seen is only refreshed by kernel-path HID writes
-                     * (the tmpld seeder) -- if that write blocks >1.5s on the
-                     * one-outstanding flow control under full raw-inject load,
-                     * the idle backstop misfires mid-stream and the resulting
-                     * template-invalidate/rebind cycle stalls injection (an
-                     * audible speaker dropout). A real flap stops producing
-                     * NOCPs for this handle, and handle-reassignment is caught
-                     * by the CONN/DISCONN handlers, so the backstop's purpose
-                     * is preserved. */
-                    g_last_seen=now_ms();
-                }
-            }
+        for(int i=0;i<nh;i++){
+            uint16_t hh=(uint16_t)((p[1+i*4]|(p[2+i*4]<<8))&0x0fff);
+            struct ds5_link *L=link_by_handle(hh);   /* credits are PER HANDLE -> per link */
+            if(!L) continue;
+            int cnt=(int)(p[3+i*4]|(p[4+i*4]<<8));
+            L->outstanding-=cnt; if(L->outstanding<0) L->outstanding=0;
+            txwin_pop(L,cnt);   /* FIFO-approximate the per-type in-flight counts */
+            /* Refresh the stall timestamp ONLY for OUR handle's completions:
+             * a global refresh would let any other device's NOCP chatter
+             * (Magic Remote etc.) suppress the 150ms backstop exactly when
+             * our credits are the ones wedged. */
+            L->last_nocp=now_ms();
+            /* NOCP for the bound handle also proves the LINK is alive:
+             * the controller is completing OUR injections. Without this,
+             * last_seen is only refreshed by kernel-path HID writes
+             * (the tmpld seeder) -- if that write blocks >1.5s on the
+             * one-outstanding flow control under full raw-inject load,
+             * the idle backstop misfires mid-stream and the resulting
+             * template-invalidate/rebind cycle stalls injection (an
+             * audible speaker dropout). A real flap stops producing
+             * NOCPs for this handle, and handle-reassignment is caught
+             * by the CONN/DISCONN handlers, so the backstop's purpose
+             * is preserved. */
+            L->last_seen=now_ms();
         }
         pthread_mutex_unlock(&g_lock);
         return;   /* NOCP never affects template validity */
     } else return;
-    if(reason){ publish_current(); fprintf(stderr,"[txd] %s -> template INVALID\n",reason); g_scan_want=2; }
+    if(reason){
+        publish_all(); fprintf(stderr,"[txd] %s -> template INVALID\n",reason);
+        if(none_bound) g_scan_want=2;   /* restore scan only once NO link remains bound */
+    }
 }
 
 /* Best-effort: seed/refresh the handle->bdaddr table from the kernel's current
@@ -834,7 +1082,7 @@ static void seed_conn_list(void){
 }
 
 /* Capture thread: watch HCI_CHANNEL_MONITOR (root) for our outgoing HID-output
- * and keep the current connection's handle+CID published — but only ever publish
+ * and keep each connection's handle+CID published — but only ever publish
  * VALID once the bound handle's bdaddr is known (fail closed). */
 static void *capture_thread(void *arg){
     (void)arg;
@@ -846,34 +1094,77 @@ static void *capture_thread(void *arg){
     if(bind(mfd,(struct sockaddr*)&ma,sizeof ma)<0){ perror("[txd] bind monitor"); close(mfd); return NULL; }
     struct timeval tv={.tv_sec=0,.tv_usec=300000}; setsockopt(mfd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
     uint8_t buf[2048];
-    uint64_t last_learn=0, last_policy=0;
-    uint16_t policy_handle=0xffff;   /* handle the last link-policy write was for */
+    uint64_t last_learn=0;
     for(;;){
         /* Idle backstop: evaluated EVERY wakeup (not only on recv-timeout) so it
          * still fires while other BT devices keep the monitor socket busy. After a
-         * flap the DS5 stops emitting HID-output -> g_last_seen ages out -> template
-         * invalidated within IDLE_INVALIDATE_MS even if the DISCONN event was lost. */
-        int idle_inval=0; int bh=-1;
+         * flap a DS5 stops emitting HID-output -> its last_seen ages out -> its link
+         * is invalidated within IDLE_INVALIDATE_MS even if the DISCONN event was
+         * lost. Snapshot each bound link's handle for the link-policy pin under the
+         * same lock. */
+        int idle_inval=0, none_bound=0;
+        int lb[MAX_LINKS], pin[MAX_LINKS]; uint16_t lh[MAX_LINKS]; uint8_t md[MAX_LINKS];
         pthread_mutex_lock(&g_lock);
-        if(g_have && now_ms()-g_last_seen>IDLE_INVALIDATE_MS){ g_have=0; idle_inval=1; }
-        if(g_have) bh=g_handle;
+        for(int i=0;i<MAX_LINKS;i++){
+            if(g_links[i].have && now_ms()-g_links[i].last_seen>IDLE_INVALIDATE_MS){
+                g_links[i].have=0; idle_inval=1;
+            }
+            lb[i]=g_links[i].have; lh[i]=g_links[i].handle; pin[i]=lb[i]; md[i]=0;
+        }
+        none_bound=!any_link_bound_locked();
+        /* Idle sniff-pin (2026-07-10): while ANY pad is in-session, keep every
+         * OTHER known DualSense (ever_bound identity, still connected per
+         * g_htab) sniff-off too. Measured A/B: an idle unbound DS5 falling into
+         * sniff steals the active pad's airtime on the sniff grid (~2.4 gap50/s
+         * vs ~0 with both links active) — the pin trades the idle pad staying
+         * in active mode (battery) for the active pad's haptic latency. Outside
+         * a session nothing is pinned: an unused pad may sniff/park freely. */
+        if(!none_bound){
+            for(int i=0;i<MAX_LINKS;i++){
+                if(pin[i] || !g_links[i].ever_bound) continue;
+                for(int h=0;h<4096;h++)
+                    if(g_htab[h].known && memcmp(g_htab[h].addr,g_links[i].bound_addr,6)==0){
+                        pin[i]=1; lh[i]=(uint16_t)h; break;
+                    }
+            }
+        }
+        for(int i=0;i<MAX_LINKS;i++) if(pin[i]) md[i]=g_htab[lh[i]].mode;
         pthread_mutex_unlock(&g_lock);
-        if(idle_inval){ publish_current(); fprintf(stderr,"[txd] link idle -> template INVALID\n"); g_scan_want=2; }
+        if(idle_inval){
+            publish_all(); fprintf(stderr,"[txd] link idle -> template INVALID\n");
+            if(none_bound) g_scan_want=2;
+        }
         /* Main-thread invalidations (EBADF / foreign-handle caught in inject_one)
          * cannot touch the command machinery (g_pend/scan state is capture-thread-
          * -owned); they raise g_scan_restore instead and the restore lands here.
-         * Skipped if a new session already rebound meanwhile — want stays 0. */
-        if(g_scan_restore){ g_scan_restore=0; if(bh<0) g_scan_want=2; }
-        /* Link-policy reconcile: pin sniff off within ~300ms of a bind (handle
-         * change) and refresh every 10s while bound; never more often than every
-         * 3s so a flap storm cannot flood the 0.5/s kernel drain (bursts beyond
-         * that are additionally absorbed by cmd_send's unacked-queue cap). */
-        if(bh>=0){
-            uint64_t t=now_ms();
-            int need = (policy_handle!=(uint16_t)bh) || (t-last_policy>10000);
-            if(need && (!last_policy || t-last_policy>3000) &&
-               send_link_policy((uint16_t)bh)==0){ last_policy=t; policy_handle=(uint16_t)bh; }
-        } else policy_handle=0xffff;
+         * Skipped if a link is still bound — scan stays off. */
+        if(g_scan_restore){ g_scan_restore=0; if(none_bound) g_scan_want=2; }
+        /* Link-policy reconcile PER bound link: pin sniff off within ~300ms of a
+         * bind (handle change) and refresh every 10s while bound; never more often
+         * than every 3s so a flap storm cannot flood the 0.5/s kernel drain (bursts
+         * beyond that are additionally absorbed by cmd_send's unacked-queue cap). */
+        for(int i=0;i<MAX_LINKS;i++){
+            struct ds5_link *L=&g_links[i];
+            if(pin[i]){
+                uint64_t t=now_ms();
+                int need = (L->policy_handle!=lh[i]) || (t-L->last_policy>10000);
+                if(need && (!L->last_policy || t-L->last_policy>3000) &&
+                   send_link_policy(lh[i])==0){
+                    if(!lb[i] && L->policy_handle!=lh[i])
+                        fprintf(stderr,"[txd] L%d idle sniff-pin handle=0x%03x (protects the active pad's airtime)\n",i,lh[i]);
+                    L->last_policy=t; L->policy_handle=lh[i];
+                }
+                /* The policy pin cannot EXIT an already-established sniff (it only
+                 * rejects future requests) — kick a sniffed pinned link back to
+                 * active explicitly. Mode Change updates g_htab[].mode, so this
+                 * sends at most once per actual sniff episode (plus the >=3s
+                 * throttle while the exit is in flight). */
+                if(md[i]==2 && t-L->last_unsniff>3000 && send_exit_sniff(lh[i])==0){
+                    L->last_unsniff=t;
+                    fprintf(stderr,"[txd] L%d handle=0x%03x in sniff while pinned -> Exit_Sniff sent\n",i,lh[i]);
+                }
+            } else L->policy_handle=0xffff;
+        }
         /* Converge the actual scan mode toward the desired one (shared limiter). */
         scan_reconcile();
         /* Command health: no ON-AIR Command Complete (monitor-observed) for the
@@ -940,48 +1231,68 @@ static void *capture_thread(void *arg){
         if(l2_len !=(uint16_t)(acl_len-4)) continue;
 
         uint16_t hh=(uint16_t)((d[0]|(d[1]<<8))&0x0fff);
-        int did_capture=0, need_learn=0; unsigned cid=0; uint16_t nonce=0;
+        int did_capture=0, need_learn=0; unsigned cid=0; uint16_t nonce=0; int slot=-1;
         pthread_mutex_lock(&g_lock);
-        /* Single inject slot: once bound, HID-output on any OTHER handle is a
-         * FOREIGN pad (reachable since the multi-pad broker — e.g. a second
-         * DualSense seeding via hidraw, or other tooling driving DS5#2). Ignore
-         * it entirely: never flip-flop the template per report, and never let
-         * foreign traffic refresh g_last_seen (the idle backstop must track the
-         * BOUND pad only). Rebind happens only after invalidation clears g_have. */
-        if(g_have && hh!=g_handle){ pthread_mutex_unlock(&g_lock); continue; }
-        g_last_seen=now_ms();
-        /* Only handle (d[0..1]) + CID (d[6..7]) are connection-constant; lengths
-         * (d[2..5]) vary per report id and are recomputed at inject. */
-        int changed = (!g_have || g_hdr[0]!=d[0]||g_hdr[1]!=d[1]||g_hdr[6]!=d[6]||g_hdr[7]!=d[7]);
-        if(changed){
-            if(g_htab[hh].known){
-                /* Identity confirmed: bind the template to the DS5 bdaddr on this
-                 * handle and go VALID. By the 0xA2 + 0x31/0x32/0x36 content filter
-                 * above, that device IS the DS5, so any later reassignment of this
-                 * handle to a different bdaddr is a contamination event we reject. */
-                memcpy(g_hdr,d,8); g_handle=hh; memcpy(g_bound_addr,g_htab[hh].addr,6);
-                g_bound_known=1; g_have=1; g_nonce++;
-                g_outstanding=0; g_last_nocp=now_ms(); txwin_reset();   /* fresh link =
-                     fresh credit window: never inherit phantom credits (or per-type
-                     counts) from a flapped connection whose NOCPs were lost (they
-                     can never be drained once g_have dropped) */
-                did_capture=1; cid=(unsigned)(d[6]|(d[7]<<8)); nonce=g_nonce;
+        /* Route this on-air HID-output to a link. Three cases:
+         *   1. Already bound to a link on THIS handle -> refresh; re-capture only if
+         *      the header (CID) actually changed (a same-handle re-bind).
+         *   2. Not bound on this handle, identity known -> bind it: reuse a slot
+         *      already holding this bdaddr (a flap/rehandle), else a FREE slot. This
+         *      is the multi-controller change — a 2nd DS5's handle no longer gets
+         *      ignored as "foreign"; it takes its own slot. Beyond MAX_LINKS slots a
+         *      further device finds none free and is ignored (never flip-flops a
+         *      bound link — the anti-contamination property for over-capacity).
+         *   3. Identity unknown -> fail CLOSED: keep seeding via hidraw until learned. */
+        struct ds5_link *L=link_by_handle(hh);
+        if(L){
+            L->last_seen=now_ms();
+            int changed=(L->hdr[0]!=d[0]||L->hdr[1]!=d[1]||L->hdr[6]!=d[6]||L->hdr[7]!=d[7]);
+            if(changed && g_htab[hh].known){
+                link_bind(L,d,hh);
+                did_capture=1; slot=(int)(L-g_links); cid=(unsigned)(d[6]|(d[7]<<8)); nonce=L->nonce;
+            }
+        } else if(g_htab[hh].known){
+            /* Identity confirmed: bind the DS5 on this handle to a slot and go VALID.
+             * By the 0xA2 + 0x31/0x32/0x36 content filter above, that device IS a
+             * DualSense, so any later reassignment of this handle to a different
+             * bdaddr is a contamination event we reject (event handlers + inject_one). */
+            L=slot_for_addr(g_htab[hh].addr);  /* same device / prior slot / free slot */
+            if(L){
+                link_bind(L,d,hh);
+                did_capture=1; slot=(int)(L-g_links); cid=(unsigned)(d[6]|(d[7]<<8)); nonce=L->nonce;
+            }
+            /* else: all slots hold OTHER devices -> ignore this over-capacity pad. */
+        } else {
+            /* Identity unknown. Before failing closed, try the app's identity
+             * ASSERT (restart fix): these on-air bytes are a content-proven DS5
+             * output; an exact match against a jail-asserted report ties handle
+             * hh to that pad's bdaddr even though no HCI connect event exists. */
+            int am=assert_match(d+9,dl-9);
+            if(am>=0){
+                memcpy(g_htab[hh].addr,g_assert[am].addr,6); g_htab[hh].known=1;
+                L=slot_for_addr(g_htab[hh].addr);
+                if(L){
+                    link_bind(L,d,hh);
+                    did_capture=2; slot=(int)(L-g_links); cid=(unsigned)(d[6]|(d[7]<<8)); nonce=L->nonce;
+                }
             } else {
-                /* Fail CLOSED: bdaddr unknown -> do NOT publish valid. The app keeps
-                 * seeding via hidraw (safe) until we learn the identity. */
+                /* Fail CLOSED: bdaddr unknown (no assert / ambiguous) -> do NOT
+                 * publish valid. The app keeps seeding via hidraw (safe) until
+                 * we learn the identity. */
                 need_learn=1;
             }
         }
         pthread_mutex_unlock(&g_lock);
         if(did_capture){
-            publish_current();
+            publish_all();
             /* Radio hygiene via the reconcilers (next loop pass, <=300ms): the
              * link-policy pin fires on the handle change, scan-off on want=0.
              * Direct sends here were unthrottled — a flap storm (bind/invalidate
              * cycling) could beat the 0.5/s kernel drain and overflow the sndbuf. */
             g_scan_want=0;
-            policy_handle=0xffff;
-            fprintf(stderr,"[txd] template handle=0x%03x CID=0x%04x nonce=%u bound (sniff-off+noscan pending)\n",hh,cid,nonce);
+            if(slot>=0) g_links[slot].policy_handle=0xffff;   /* force a re-pin for this link */
+            fprintf(stderr,"[txd] L%d template handle=0x%03x CID=0x%04x nonce=%u bound%s (sniff-off+noscan pending)\n",
+                    slot,hh,cid,nonce,did_capture==2?" [identity from app assert]":"");
         }
         if(need_learn){
             /* Throttled refresh of the handle->bdaddr table for the case where the
@@ -990,6 +1301,64 @@ static void *capture_thread(void *arg){
             uint64_t t=now_ms();
             if(t-last_learn>500){ last_learn=t; seed_conn_list(); }
         }
+    }
+}
+
+/* Route + inject one inbound report onto its link (main/inject thread). report/n
+ * is the raw HID-output (tag already stripped). Preserves the exact rumble-first /
+ * audio-FIFO ordering the single-link path had, now scoped to link L. snap_nonce is
+ * L's template generation this wakeup (stamps held FIFO frames). */
+static void process_report(struct ds5_link *L, int rawfd, const uint8_t *report, int n,
+                           uint16_t snap_nonce, int fdepth, int maxq, const uint8_t *expect,
+                           long *injected, long *dropped, long *paced){
+    int need_inval=0; const char *reason=NULL; int r;
+    if(report[0]!=0x36){
+        /* Rumble FIRST, before the audio backlog: it is an independent stream (its
+         * ordering vs audio does not matter), and draining held audio ahead of it
+         * would hand every freed credit to audio within the same wakeup — starvation
+         * by ordering, on top of the type-aware window in inject_one(). Rumble itself
+         * stays latest-wins on a full window: a stale rumble is wrong. */
+        r=inject_one(L,rawfd,report,n,maxq,&reason,expect);
+        if(r==1)(*injected)++;
+        else if(r==-1)need_inval=1;
+        else if(r==0)(*paced)++;         /* latest-wins drop */
+        else (*dropped)++;               /* r==-2: no live template */
+        if(!need_inval)(*injected)+=drain_fifo(L,rawfd,maxq,&need_inval,&reason,expect);
+    } else {
+        /* Audio: strict FIFO order — backlog first, then the fresh frame. On a full
+         * window with the FIFO enabled the fresh frame is HELD (few-ms delay, drained
+         * on the next arrival) rather than punching a ~10ms hole; FIFO-off stays
+         * latest-wins. */
+        (*injected)+=drain_fifo(L,rawfd,maxq,&need_inval,&reason,expect);
+        if(need_inval){
+            (*dropped)++;                /* template just died; fresh frame is moot */
+        } else {
+            r=inject_one(L,rawfd,report,n,maxq,&reason,expect);
+            if(r==1)(*injected)++;
+            else if(r==-1){ need_inval=1; fifo_clear(L); }
+            else if(r==0){
+                if(fdepth>0 && n<=FIFO_ENTRY_MAX){
+                    /* Evict-to-fit: fdepth can be LOWERED at runtime; a single-evict
+                     * would balance every insert and keep the count at the old
+                     * high-water forever under congestion, voiding the latency bound. */
+                    while(L->fifo_count>=fdepth){ L->fifo_head=(L->fifo_head+1)%FIFO_MAX; L->fifo_count--; (*dropped)++; }
+                    int tail=(L->fifo_head+L->fifo_count)%FIFO_MAX;
+                    memcpy(L->fifo[tail].buf,report,(size_t)n); L->fifo[tail].len=n; L->fifo_count++;
+                    L->fifo_gen=snap_nonce;   /* held under THIS binding */
+                } else {
+                    (*paced)++;              /* legacy latest-wins drop */
+                }
+            }
+            else (*dropped)++;               /* r==-2: no live template */
+        }
+    }
+    if(need_inval){
+        publish_all(); fprintf(stderr,"[txd] %s\n",reason);
+        /* Scan restore for MAIN-thread invalidations: this thread must not touch the
+         * capture-owned command machinery, so it only raises the flag; the capture
+         * loop sends the mode-2 restore (and ignores it if a link is still bound or a
+         * new session rebinds first). */
+        g_scan_restore=1;
     }
 }
 
@@ -1006,7 +1375,10 @@ int main(int argc,char**argv){
     struct sched_param sp; memset(&sp,0,sizeof sp); sp.sched_priority=14;
     sched_setscheduler(0,SCHED_FIFO,&sp);
 
-    publish(0,0,NULL);   /* start INVALID so a stale boot file can't mislead the app */
+    for(int i=0;i<MAX_LINKS;i++){ g_links[i].policy_handle=0xffff; g_links[i].last_nocp=now_ms(); }
+
+    publish_record(g_tmpl_path,0,0,NULL);   /* start INVALID so a stale boot file can't mislead the app */
+    invalidate_stale_addr_files();          /* same for per-address files of a previous run */
     seed_conn_list();    /* identity-bind a controller already connected at startup */
 
     /* Root HCI raw socket for injection (write is permitted as root). Bound to the
@@ -1024,21 +1396,15 @@ int main(int argc,char**argv){
     int ufd=bind_unix_dgram(sock_path);
     if(ufd<0){ perror("[txd] bind unix"); return 1; }
 
-    /* Seed the stall backstop BEFORE the worker threads exist: g_last_nocp is a
-     * 64-bit field guarded by g_lock, and an unlocked store after thread creation
-     * could tear against a capture-thread writer on 32-bit ARM. Pre-thread, plain
-     * store is fine and output still can't wedge before the first NOCP. */
-    g_last_nocp=now_ms();
-
     pthread_t cap; pthread_create(&cap,NULL,capture_thread,NULL);
     pthread_t brk; pthread_create(&brk,NULL,broker_thread,(void*)hidfd_path);
-    fprintf(stderr,"[txd] forwarder up (cmdguard): unix=%s tmpl=%s hidfd=%s\n",sock_path,g_tmpl_path,hidfd_path);
+    fprintf(stderr,"[txd] forwarder up (cmdguard, %d links): unix=%s tmpl=%s hidfd=%s\n",MAX_LINKS,sock_path,g_tmpl_path,hidfd_path);
 
     /* Event loop: wait on forwarded reports (ufd) AND mount-table changes (minfo)
      * at once. Pure poll(-1) in steady state; a 500ms tick engages only while a
      * rebind is pending or the mount watch is unavailable (degrade to polling). */
     int minfo=open_mount_watch();   /* self-heal ds5_acl.sock across jail-tmp remounts */
-    uint8_t rep[ACL_MAX_REPORT];   /* inject framing now lives in inject_one() */
+    uint8_t rep[ACL_TAG_LEN+ACL_MAX_REPORT];   /* tag (optional) + report; inject framing in inject_one() */
     long injected=0, dropped=0, paced=0; uint64_t last_log=now_ms();
     for(;;){
         struct pollfd pfd[2]={{ufd,POLLIN,0},{minfo,POLLPRI,0}};
@@ -1057,52 +1423,71 @@ int main(int argc,char**argv){
                 int nu=bind_unix_dgram(sock_path);
                 if(nu>=0){
                     ufd=nu;
-                    publish_current();   /* re-publish current state into the new mount */
+                    publish_all();   /* re-publish current state into the new mount */
                     fprintf(stderr,"[txd] jail-tmp remount -> rebound ds5_acl.sock + re-published\n");
                 }
             }
         }
 
-        /* Drain reports queued on the (non-blocking) report socket, bounded per
-         * wakeup so a flood can't monopolize the loop or starve the mount watch. */
-        /* Radio-episode detector: outstanding credits with no NOCP for >80ms
-         * means the controller is not getting airtime (WiFi-scan blackout,
-         * interference burst) -- the invisible cause of "late but not lost"
-         * audio/input. Timestamped so felt dropouts can be correlated. */
-        uint16_t snap_nonce=0;   /* template generation this wakeup (stamps FIFO entries) */
+        /* Per-link radio-episode detector + sub-episode gap histogram (the A/B
+         * acceptance signal). Outstanding credits with no NOCP for >80ms means the
+         * controller is not getting airtime (WiFi-scan blackout, interference burst)
+         * -- the invisible cause of "late but not lost" audio/input. Each link is
+         * tracked independently so a 2-pad session shows which pad is starved. */
+        uint16_t link_nonce[MAX_LINKS];
         {
-            static uint64_t ep_start=0, gap_hi=0;
+            struct { int have, qd; uint64_t ln; uint16_t nonce; } sn[MAX_LINKS];
             uint64_t nowm=now_ms();
             pthread_mutex_lock(&g_lock);
-            int qd=g_outstanding; uint64_t ln=g_last_nocp; int hv=g_have;
-            snap_nonce=g_nonce;
-            pthread_mutex_unlock(&g_lock);
-            /* Stale-backlog gate: a rebind bumps the nonce, so audio still held
-             * from the previous binding must be dropped, not played into the new
-             * session (drain_fifo also clears on the no-template path, but that
-             * never runs when the invalidate->rebind happens between wakeups). */
-            if(g_fifo_count>0 && g_fifo_gen!=snap_nonce) fifo_clear();
-            if(hv && qd>0 && ln && nowm-ln>80){
-                if(!ep_start){ ep_start=nowm; fprintf(stderr,"[txd] EPISODE start t=%llu q=%d\n",(unsigned long long)nowm,qd); }
-            } else if(ep_start){
-                fprintf(stderr,"[txd] EPISODE end t=%llu dur=%dms\n",(unsigned long long)nowm,(int)(nowm-ep_start));
-                ep_start=0;
+            for(int i=0;i<MAX_LINKS;i++){
+                sn[i].have=g_links[i].have; sn[i].qd=g_links[i].outstanding;
+                sn[i].ln=g_links[i].last_nocp; sn[i].nonce=g_links[i].nonce;
             }
-            /* Sub-episode gap histogram: the EPISODE lines only show >80ms, but a
-             * 56ms DS5 buffer already underruns on 50-80ms NOCP gaps (the felt
-             * "minimal dropouts" tail at low slider values, 2026-07-05). Track the
-             * high-watermark of each credit-starved stretch and bucket it when a
-             * NOCP resets the gap. Loop wakes ~94/s in-session -> ~10ms resolution. */
-            uint64_t cur=(hv && qd>0 && ln)?(nowm-ln):0;
-            if(cur>gap_hi) gap_hi=cur;
-            else if(gap_hi){
-                if(gap_hi>=80) g_gap80++;
-                else if(gap_hi>=50) g_gap50++;
-                else if(gap_hi>=30) g_gap30++;
-                gap_hi=0;
+            pthread_mutex_unlock(&g_lock);
+            for(int i=0;i<MAX_LINKS;i++){
+                struct ds5_link *L=&g_links[i];
+                link_nonce[i]=sn[i].nonce;
+                /* Per-binding telemetry: a rebind (nonce bump) starts a FRESH gap
+                 * histogram so the 10s status line measures THIS binding, not the
+                 * slot's whole lifetime — cumulative counts across rebinds/address
+                 * swaps were useless for A/B deltas. The outgoing counts are
+                 * logged, so nothing is lost. Reset here (inject thread owns the
+                 * histogram), not in link_bind (capture thread — would race). */
+                if(L->tele_gen!=sn[i].nonce){
+                    if(L->gap30||L->gap50||L->gap80)
+                        fprintf(stderr,"[txd] L%d gap histogram reset on rebind (was %ld/%ld/%ld)\n",
+                                i,L->gap30,L->gap50,L->gap80);
+                    L->gap30=L->gap50=L->gap80=0; L->ep_start=0; L->gap_hi=0;
+                    L->tele_gen=sn[i].nonce;
+                }
+                /* Stale-backlog gate: a rebind bumps the nonce, so audio still held
+                 * from the previous binding must be dropped, not played into the new
+                 * session (drain_fifo also clears on the no-template path, but that
+                 * never runs when the invalidate->rebind happens between wakeups). */
+                if(L->fifo_count>0 && L->fifo_gen!=sn[i].nonce) fifo_clear(L);
+                if(sn[i].have && sn[i].qd>0 && sn[i].ln && nowm-sn[i].ln>80){
+                    if(!L->ep_start){ L->ep_start=nowm; fprintf(stderr,"[txd] L%d EPISODE start t=%llu q=%d\n",i,(unsigned long long)nowm,sn[i].qd); }
+                } else if(L->ep_start){
+                    fprintf(stderr,"[txd] L%d EPISODE end t=%llu dur=%dms\n",i,(unsigned long long)nowm,(int)(nowm-L->ep_start));
+                    L->ep_start=0;
+                }
+                /* Sub-episode gap histogram: the EPISODE lines only show >80ms, but a
+                 * 56ms DS5 buffer already underruns on 50-80ms NOCP gaps. Track the
+                 * high-watermark of each credit-starved stretch and bucket it when a
+                 * NOCP resets the gap. Loop wakes ~94/s in-session -> ~10ms res. */
+                uint64_t cur=(sn[i].have && sn[i].qd>0 && sn[i].ln)?(nowm-sn[i].ln):0;
+                if(cur>L->gap_hi) L->gap_hi=cur;
+                else if(L->gap_hi){
+                    if(L->gap_hi>=80) L->gap80++;
+                    else if(L->gap_hi>=50) L->gap50++;
+                    else if(L->gap_hi>=30) L->gap30++;
+                    L->gap_hi=0;
+                }
             }
         }
         if(ufd>=0 && (pfd[0].revents&POLLIN)){
+            int maxq=inject_maxq();     /* per-wakeup constants (fopen /tmp ~1/s, never under g_lock) */
+            int fdepth=inject_fifo();
             for(int drained=0; drained<DRAIN_CAP; drained++){
                 struct iovec iov={.iov_base=rep,.iov_len=sizeof rep};
                 union { char b[CMSG_SPACE(sizeof(struct ucred))]; struct cmsghdr a; } cmsgu;
@@ -1113,73 +1498,54 @@ int main(int argc,char**argv){
                 if(n==0) continue;                             /* zero-length datagram: skip, keep draining */
                 if(mh.msg_flags & MSG_TRUNC){ dropped++; continue; } /* oversized: never inject a truncated frame */
                 if(!cred_ok(&mh)){ dropped++; continue; }      /* peer-cred gate: jail uid only */
-                if(!injectable(rep[0])){ dropped++; continue; }/* only DS5 output reports (0x31/0x32/0x36) */
 
-                int need_inval=0; const char *reason=NULL;
-                /* Read the tunables BEFORE taking g_lock: they fopen /tmp ~1/s and
-                 * g_lock must never wrap filesystem I/O (see the invariant above
-                 * g_lock). Per-report constants. inject_one() takes/releases g_lock
-                 * itself per frame, keeping each critical section as short as the
-                 * legacy inline path. */
-                int maxq=inject_maxq();
-                int fdepth=inject_fifo();
-                int r;
-
-                if(rep[0]!=0x36){
-                    /* Rumble FIRST, before the audio backlog: it is an independent
-                     * stream (its ordering vs audio does not matter), and draining
-                     * held audio ahead of it would hand every freed credit to audio
-                     * within the same wakeup — starvation by ordering, on top of
-                     * the type-aware window in inject_one(). Rumble itself stays
-                     * latest-wins on a full window: a stale rumble is wrong. */
-                    r=inject_one(rawfd,rep,(int)n,maxq,&reason);
-                    if(r==1) injected++;
-                    else if(r==-1) need_inval=1;
-                    else if(r==0) paced++;         /* latest-wins drop */
-                    else dropped++;                /* r==-2: no live template */
-                    if(!need_inval) injected+=drain_fifo(rawfd,maxq,&need_inval,&reason);
-                } else {
-                    /* Audio: strict FIFO order — backlog first, then the fresh
-                     * frame. On a full window with the FIFO enabled the fresh frame
-                     * is HELD (few-ms delay, drained on the next arrival) rather
-                     * than punching a ~10ms hole; FIFO-off stays latest-wins. */
-                    injected+=drain_fifo(rawfd,maxq,&need_inval,&reason);
-                    if(need_inval){
-                        dropped++;                 /* template just died; fresh frame is moot */
-                    } else {
-                        r=inject_one(rawfd,rep,(int)n,maxq,&reason);
-                        if(r==1) injected++;
-                        else if(r==-1){ need_inval=1; fifo_clear(); }
-                        else if(r==0){
-                            if(fdepth>0 && (int)n<=FIFO_ENTRY_MAX){
-                                /* Evict-to-fit: fdepth can be LOWERED at runtime; a
-                                 * single-evict would balance every insert and keep
-                                 * the count at the old high-water forever under
-                                 * congestion, voiding the latency bound. */
-                                while(g_fifo_count>=fdepth){ g_fifo_head=(g_fifo_head+1)%FIFO_MAX; g_fifo_count--; dropped++; }
-                                int tail=(g_fifo_head+g_fifo_count)%FIFO_MAX;
-                                memcpy(g_fifo[tail].buf,rep,(size_t)n); g_fifo[tail].len=(int)n; g_fifo_count++;
-                                g_fifo_gen=snap_nonce;   /* held under THIS binding */
-                            } else {
-                                paced++;           /* legacy latest-wins drop */
-                            }
-                        }
-                        else dropped++;            /* r==-2: no live template */
+                /* Route: a tagged datagram ([0xA5][0x5A][addr6][report]) goes to the
+                 * link bound to that address; an untagged one (legacy/USB) to the
+                 * PRIMARY link (g_links[0]) — byte-for-byte the old single-pad path. */
+                const uint8_t *report; int rlen; struct ds5_link *L; const uint8_t *expect=NULL;
+                if(n>=(ssize_t)(ACL_TAG_LEN+1) && rep[0]==ACL_TAG_M0 && rep[1]==ACL_TAG_M1){
+                    report=rep+ACL_TAG_LEN; rlen=(int)(n-ACL_TAG_LEN); expect=rep+2;
+                    pthread_mutex_lock(&g_lock);
+                    L=link_by_addr(expect);
+                    if(!L && rlen>0 && rlen<=ASSERT_MAX && injectable(report[0])){
+                        /* No link for this pad yet: keep the datagram as an
+                         * identity ASSERT the capture thread matches against the
+                         * on-air hidraw seeding of the same bytes (restart fix). */
+                        g_assert[g_assert_next].ts=now_ms();
+                        memcpy(g_assert[g_assert_next].addr,expect,6);
+                        g_assert[g_assert_next].len=(uint16_t)rlen;
+                        memcpy(g_assert[g_assert_next].buf,report,(size_t)rlen);
+                        g_assert_next=(g_assert_next+1)%ASSERT_RING;
                     }
+                    pthread_mutex_unlock(&g_lock);
+                    if(!L){ dropped++; continue; }             /* no link for this target (not ready) */
+                } else {
+                    report=rep; rlen=(int)n; L=&g_links[0];     /* legacy untagged -> primary link */
                 }
-                if(need_inval){
-                    publish_current(); fprintf(stderr,"[txd] %s\n",reason);
-                    /* Scan restore for MAIN-thread invalidations: this thread must
-                     * not touch the capture-owned command machinery, so it only
-                     * raises the flag; the capture loop sends the mode-2 restore
-                     * (and ignores it if a new session rebinds first). Without
-                     * this, an EBADF/foreign-handle invalidation left page scan
-                     * off until the LG stack happened to re-enable it. */
-                    g_scan_restore=1;
-                }
+                if(rlen<=0 || rlen>ACL_MAX_REPORT){ dropped++; continue; }
+                if(!injectable(report[0])){ dropped++; continue; }  /* only DS5 output reports */
+
+                int idx=(int)(L-g_links);
+                process_report(L,rawfd,report,rlen,link_nonce[idx],fdepth,maxq,expect,&injected,&dropped,&paced);
             }
         }
-        if(now_ms()-last_log>10000){ fprintf(stderr,"[txd] inj=%ld drop=%ld backoff=%ld q=%d/%d rq=%d fifo=%d/%d scanctr=%ld gaps=%ld/%ld/%ld pend=%d%s\n",injected,dropped,paced,g_outstanding,inject_maxq(),g_rumble_fly,g_fifo_count,inject_fifo(),g_scan_ctr,g_gap30,g_gap50,g_gap80,g_pend_n,g_cmd_dead?" CMDDEAD":""); last_log=now_ms(); }
+        if(now_ms()-last_log>10000){
+            char links[MAX_LINKS*160]; int lo=0; links[0]='\0';
+            for(int i=0;i<MAX_LINKS;i++){
+                struct ds5_link *L=&g_links[i];
+                if(!L->ever_bound) continue;
+                const uint8_t*a=L->bound_addr;
+                lo+=snprintf(links+lo,sizeof links-lo,
+                    " | L%d %02x:%02x:%02x:%02x:%02x:%02x have=%d q=%d rq=%d fifo=%d gaps=%ld/%ld/%ld",
+                    i,a[5],a[4],a[3],a[2],a[1],a[0],L->have,L->outstanding,L->rumble_fly,
+                    L->fifo_count,L->gap30,L->gap50,L->gap80);
+                if(lo>=(int)sizeof links) break;
+            }
+            fprintf(stderr,"[txd] inj=%ld drop=%ld backoff=%ld maxq=%d fifo=%d scanctr=%ld pend=%d%s%s\n",
+                injected,dropped,paced,inject_maxq(),inject_fifo(),g_scan_ctr,g_pend_n,
+                g_cmd_dead?" CMDDEAD":"", links);
+            last_log=now_ms();
+        }
     }
     return 0;
 }
