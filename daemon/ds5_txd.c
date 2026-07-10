@@ -135,11 +135,29 @@
 #define DS5_VID             0x054c /* Sony      } primary device; the broker additionally */
 #define DS5_PID             0x0ce6 /* DualSense } allows a small game-pad list, see PAD_ALLOW */
 
-/* Tagged-datagram framing: [ACL_TAG_M0][ACL_TAG_M1][addr 6, LSB-first][report].
+/* Tagged-datagram framing: [ACL_TAG_M0][kind][addr 6, LSB-first][report].
  * ACL_TAG_M0 (0xA5) is not a DS5 output report id (0x31/0x32/0x36), so a tagged
- * datagram is told apart from a legacy untagged one by byte 0 alone. */
+ * datagram is told apart from a legacy untagged one by byte 0 alone.
+ *
+ * `kind` separates the two things a tagged datagram can mean, because conflating
+ * them double-sends every report across the readiness flip: the app keeps seeding
+ * via hidraw for up to one readiness-poll interval AFTER the daemon has bound the
+ * link, and an inject-kind datagram arriving in that window is injected while the
+ * app also writes it to hidraw — the same frame on air twice.
+ *   ACL_TAG_INJECT (0x5A): forward it. The app sends this only while it believes
+ *                          the link is READY, i.e. while it is NOT writing hidraw.
+ *   ACL_TAG_ASSERT (0x5B): identity assertion only, NEVER injected. The app sends
+ *                          this alongside its hidraw seed while NOT ready, so the
+ *                          capture thread can match the bytes it sees on air and
+ *                          learn handle->bdaddr (see the assert ring). Because it
+ *                          is never injected, it stays harmless once the link has
+ *                          bound but the app has not yet noticed.
+ * An old app that only sends 0x5A keeps working (its asserts inject once bound —
+ * the double-send window); an old daemon drops 0x5B (byte 0 is not a report id),
+ * so the app just stays on hidraw. Both degrade safely. */
 #define ACL_TAG_M0          0xA5
-#define ACL_TAG_M1          0x5A
+#define ACL_TAG_INJECT      0x5A
+#define ACL_TAG_ASSERT      0x5B
 #define ACL_TAG_LEN         8
 
 struct sockaddr_hci { unsigned short hci_family, hci_dev, hci_channel; };
@@ -212,7 +230,14 @@ static int inject_maxq(void){
  * latency is bounded by N frames (~10.7ms each). Live-tunable via
  * /tmp/ds5_inject_fifo (0..FIFO_MAX). Cached ~1/sec. Each link has its own FIFO. */
 #define FIFO_MAX             16
-#define FIFO_ENTRY_MAX       256   /* audio 0x36 reports are well under this */
+#define FIFO_ENTRY_MAX       1024   /* == ASSERT_MAX: the worst-case on-air 0x36 audio
+                                     * report (kept in sync by hand — ASSERT_MAX is
+                                     * defined later so it can't be referenced here). At
+                                     * 256 a real >256B audio frame would skip the FIFO
+                                     * entirely (n<=FIFO_ENTRY_MAX gate) and fall to
+                                     * latest-wins drop, silently defeating the
+                                     * anti-dropout buffering. 16 entries x 1KB per link
+                                     * is negligible. */
 #define INJECT_FIFO_DEFAULT  0
 static int inject_fifo(void){
     static int d=INJECT_FIFO_DEFAULT; static uint64_t last=0;
@@ -258,6 +283,12 @@ struct ds5_link {
     uint8_t  bound_addr[6];  /* device identity captured with the template (LSB-first) */
     int      bound_known;    /* bound_addr is valid */
     int      ever_bound;     /* bound_addr is meaningful for the per-address file path */
+    int      assert_learned; /* identity came from a JAIL-supplied assert, not a kernel
+                              * event (no CONN_COMPLETE at restart). Such a binding is
+                              * NOT trusted to survive a later kernel connect on its
+                              * handle — see the CONN/LE handlers — else a lie asserted
+                              * for a victim's bdaddr could pre-authorise inject onto a
+                              * reused handle (would defeat defence (b)). */
     /* credit window (g_lock) */
     int      outstanding;    /* our raw-ACL TX packets queued in the controller, not yet
                                 confirmed on-air (via HCI Number_Of_Completed_Packets) */
@@ -318,7 +349,12 @@ static const char *g_tmpl_path;
  * we already hold, seeded by HCIGETCONNLIST. No address is hardcoded — the binding
  * self-configures, so swapping controllers needs no rebuild. The table is SHARED
  * across links (it is just the adapter's handle map). */
-struct htab_ent { uint8_t addr[6]; uint8_t known; uint8_t mode; };  /* mode: HCI Mode Change (0=active,2=sniff) */
+struct htab_ent { uint8_t addr[6]; uint8_t known; uint8_t mode; uint8_t from_assert; };
+/* mode: HCI Mode Change (0=active,2=sniff). from_assert: this handle's address was
+ * learned from a jail identity-assert, not a kernel connect event -> any link bound
+ * off it inherits assert_learned taint (so a later kernel connect re-derives it).
+ * The taint lives on the htab entry, not just the link, so it survives an
+ * idle-invalidate + rebind from the same handle (a per-link flag was lost there). */
 static struct htab_ent g_htab[4096];   /* indexed by handle & 0x0fff */
 
 /* ---- identity-assert ring (restart fix, 2026-07-10) ------------------------ *
@@ -359,6 +395,32 @@ static int assert_match(const uint8_t *rep, int rl){
         if(am<0) am=i;
     }
     return am;
+}
+
+/* A single content match is not enough to bind an assert-derived identity: with two
+ * pads seeding post-restart, pad Y's on-air frame can transiently match pad X's live
+ * assertion when Y's OWN assertion is momentarily absent from the ring (best-effort,
+ * EAGAIN-dropped, or evicted at ASSERT_RING=16). Binding on that one collision routes
+ * X's INJECT datagrams onto Y's handle AND locks X out for the whole session (X's
+ * address is then "already bound" -> assert_match ambiguity forever). Require the SAME
+ * (handle -> asserted address) to recur across ASSERT_CONFIRM on-air frames: a genuine
+ * pad, whose reports are asserted continuously, confirms within one extra frame (~10ms),
+ * while a spurious match would need two aligned content+seq collisions in a row on one
+ * handle. Capture-thread-only state (touched under g_lock in the unknown-identity path);
+ * MAX_LINKS+1 candidate slots cover every simultaneously-seeding pad with a spare. */
+#define ASSERT_CONFIRM 2
+static struct { uint16_t hh; uint8_t addr[6]; uint8_t cnt; uint64_t ts; } g_acand[MAX_LINKS+1];
+static int assert_confirm(uint16_t hh, const uint8_t addr[6]){
+    uint64_t t=now_ms(); int slot=-1, oldest=0;
+    for(int i=0;i<(int)(sizeof g_acand/sizeof g_acand[0]);i++){
+        if(g_acand[i].ts && t-g_acand[i].ts<=ASSERT_TTL_MS && g_acand[i].hh==hh){ slot=i; break; }
+        if(!g_acand[i].ts || g_acand[i].ts<g_acand[oldest].ts) oldest=i;
+    }
+    if(slot<0){ slot=oldest; g_acand[slot].hh=hh; g_acand[slot].cnt=0; memcpy(g_acand[slot].addr,addr,6); }
+    if(memcmp(g_acand[slot].addr,addr,6)!=0){ memcpy(g_acand[slot].addr,addr,6); g_acand[slot].cnt=0; }
+    g_acand[slot].ts=t;
+    if(g_acand[slot].cnt<255) g_acand[slot].cnt++;
+    return g_acand[slot].cnt>=ASSERT_CONFIRM;
 }
 
 /* ---- link lookup helpers (all assume g_lock held) -------------------------- */
@@ -403,6 +465,9 @@ static int any_link_bound_locked(void){
 static void link_bind(struct ds5_link *L, const uint8_t hdr8[8], uint16_t hh){
     memcpy(L->hdr,hdr8,8); L->handle=hh; memcpy(L->bound_addr,g_htab[hh].addr,6);
     L->bound_known=1; L->have=1; L->ever_bound=1; L->nonce++;
+    L->assert_learned=g_htab[hh].from_assert;   /* inherit the handle's taint: a rebind
+                                                 * from an assert-sourced htab entry stays
+                                                 * assert_learned even across idle-flaps */
     L->outstanding=0; L->last_nocp=now_ms(); txwin_reset(L);
     L->last_seen=now_ms();
 }
@@ -982,9 +1047,18 @@ static void handle_hci_event(const uint8_t *e, int el){
         if(p[0]!=0x00) return;
         uint16_t hh=(uint16_t)((p[1]|(p[2]<<8))&0x0fff);
         pthread_mutex_lock(&g_lock);
-        memcpy(g_htab[hh].addr,p+3,6); g_htab[hh].known=1; g_htab[hh].mode=0; /* fresh link = active */
+        memcpy(g_htab[hh].addr,p+3,6); g_htab[hh].known=1; g_htab[hh].mode=0; g_htab[hh].from_assert=0; /* kernel-proven, active */
         struct ds5_link *L=link_by_handle(hh);
-        if(L && memcmp(p+3,L->bound_addr,6)!=0){ L->have=0; reason="bound handle reassigned (BR/EDR)"; }
+        /* An assert-learned link is dropped on ANY kernel connect for its handle, even
+         * when the addresses agree: the kernel is now the authority on what this handle
+         * carries, and an agreeing address proves nothing when the address itself came
+         * from the jail. The link re-binds from the next on-air DS5 output under the
+         * now-trusted g_htab entry. See ds5_link.assert_learned. */
+        if(L && (L->assert_learned || memcmp(p+3,L->bound_addr,6)!=0)){
+            L->have=0;
+            reason = L->assert_learned ? "kernel connect supersedes assert-learned identity (BR/EDR)"
+                                       : "bound handle reassigned (BR/EDR)";
+        }
         none_bound=!any_link_bound_locked();
         pthread_mutex_unlock(&g_lock);
     } else if(code==HCI_EV_DISCONN_COMPLETE && pl>=4){      /* status,handle(2),reason */
@@ -1002,9 +1076,13 @@ static void handle_hci_event(const uint8_t *e, int el){
         if((p[0]!=HCI_SUBEV_LE_CONN && p[0]!=HCI_SUBEV_LE_ENH_CONN) || p[1]!=0x00) return;
         uint16_t hh=(uint16_t)((p[2]|(p[3]<<8))&0x0fff);
         pthread_mutex_lock(&g_lock);
-        memcpy(g_htab[hh].addr,p+6,6); g_htab[hh].known=1; g_htab[hh].mode=0;
+        memcpy(g_htab[hh].addr,p+6,6); g_htab[hh].known=1; g_htab[hh].mode=0; g_htab[hh].from_assert=0; /* kernel-proven */
         struct ds5_link *L=link_by_handle(hh);
-        if(L && memcmp(p+6,L->bound_addr,6)!=0){ L->have=0; reason="bound handle reassigned (LE)"; }
+        if(L && (L->assert_learned || memcmp(p+6,L->bound_addr,6)!=0)){
+            L->have=0;
+            reason = L->assert_learned ? "kernel connect supersedes assert-learned identity (LE)"
+                                       : "bound handle reassigned (LE)";
+        }
         none_bound=!any_link_bound_locked();
         pthread_mutex_unlock(&g_lock);
     } else if(code==HCI_EV_NUM_COMP_PKTS && pl>=1){        /* TX credits returned: free the outstanding window */
@@ -1033,7 +1111,18 @@ static void handle_hci_event(const uint8_t *e, int el){
              * audible speaker dropout). A real flap stops producing
              * NOCPs for this handle, and handle-reassignment is caught
              * by the CONN/DISCONN handlers, so the backstop's purpose
-             * is preserved. */
+             * is preserved.
+             * RESIDUAL RISK (accepted): if BOTH the DISCONN and the foreign
+             * reuse-CONN for this 12-bit handle are lost on the monitor, and the
+             * foreign device returns NOCPs for our injected ACL, this refresh
+             * keeps the idle backstop from firing -> injection onto a non-DS5
+             * until a later CONN/DISCONN corrects g_htab. It stays narrow because
+             * injection is driven by the app, which is bound to the REAL hidraw
+             * node: when the DS5 leaves, hidraw vanishes, the app tears the
+             * controller down and stops forwarding, so injection (and these
+             * NOCPs) stops on its own. Closing it fully needs an on-air identity
+             * re-check, but HCIGETCONNLIST is empty on webOS and our own injects
+             * aren't mirrored on MONITOR -> no cheap in-session identity signal. */
             L->last_seen=now_ms();
         }
         pthread_mutex_unlock(&g_lock);
@@ -1071,7 +1160,7 @@ static void seed_conn_list(void){
     for(int i=0;i<n;i++){
         uint16_t hh=req.ci[i].handle & 0x0fff;
         if(!g_htab[hh].known || memcmp(g_htab[hh].addr,req.ci[i].bdaddr.b,6)!=0){
-            memcpy(g_htab[hh].addr,req.ci[i].bdaddr.b,6); g_htab[hh].known=1;
+            memcpy(g_htab[hh].addr,req.ci[i].bdaddr.b,6); g_htab[hh].known=1; g_htab[hh].from_assert=0; /* kernel conn list */
             chg[nchg].hh=hh; memcpy(chg[nchg].a,req.ci[i].bdaddr.b,6); nchg++;
         }
     }
@@ -1268,11 +1357,27 @@ static void *capture_thread(void *arg){
              * output; an exact match against a jail-asserted report ties handle
              * hh to that pad's bdaddr even though no HCI connect event exists. */
             int am=assert_match(d+9,dl-9);
+            /* An address can live on exactly ONE handle. If the asserted address is
+             * already bound elsewhere, these on-air bytes are NOT that pad's — they
+             * are a second DualSense whose (independently sequenced) report happened
+             * to be byte-identical to a live assertion. Binding here would drag the
+             * asserting pad's link onto the wrong handle and cross-route its haptics.
+             * Fail closed instead: the other pad keeps seeding until it asserts bytes
+             * of its own. (The ambiguity check inside assert_match only covers the
+             * case where BOTH pads asserted the same bytes.) */
+            if(am>=0 && link_by_addr(g_assert[am].addr)) am=-2;
+            /* Demand ASSERT_CONFIRM consecutive matches of this (handle -> address)
+             * before trusting the identity; one collision keeps seeding (need_learn). */
+            if(am>=0 && !assert_confirm(hh,g_assert[am].addr)) am=-1;
             if(am>=0){
                 memcpy(g_htab[hh].addr,g_assert[am].addr,6); g_htab[hh].known=1;
+                g_htab[hh].from_assert=1;   /* jail-sourced identity: taint the htab entry
+                                             * so this and any rebind off hh stay
+                                             * assert_learned until a kernel connect (defence
+                                             * (b) must not be silenced by a lied addr) */
                 L=slot_for_addr(g_htab[hh].addr);
                 if(L){
-                    link_bind(L,d,hh);
+                    link_bind(L,d,hh);   /* inherits assert_learned=1 via from_assert */
                     did_capture=2; slot=(int)(L-g_links); cid=(unsigned)(d[6]|(d[7]<<8)); nonce=L->nonce;
                 }
             } else {
@@ -1499,31 +1604,45 @@ int main(int argc,char**argv){
                 if(mh.msg_flags & MSG_TRUNC){ dropped++; continue; } /* oversized: never inject a truncated frame */
                 if(!cred_ok(&mh)){ dropped++; continue; }      /* peer-cred gate: jail uid only */
 
-                /* Route: a tagged datagram ([0xA5][0x5A][addr6][report]) goes to the
-                 * link bound to that address; an untagged one (legacy/USB) to the
-                 * PRIMARY link (g_links[0]) — byte-for-byte the old single-pad path. */
+                /* Route by tag kind (see ACL_TAG_*): an INJECT datagram goes to the
+                 * link bound to that address; an ASSERT datagram only feeds the
+                 * identity ring and is never injected; an untagged one (legacy/USB)
+                 * goes to the PRIMARY link (g_links[0]) — byte-for-byte the old
+                 * single-pad path. */
                 const uint8_t *report; int rlen; struct ds5_link *L; const uint8_t *expect=NULL;
-                if(n>=(ssize_t)(ACL_TAG_LEN+1) && rep[0]==ACL_TAG_M0 && rep[1]==ACL_TAG_M1){
+                int tagged = (n>=(ssize_t)(ACL_TAG_LEN+1) && rep[0]==ACL_TAG_M0 &&
+                              (rep[1]==ACL_TAG_INJECT || rep[1]==ACL_TAG_ASSERT));
+                if(tagged){
+                    int is_assert=(rep[1]==ACL_TAG_ASSERT);
                     report=rep+ACL_TAG_LEN; rlen=(int)(n-ACL_TAG_LEN); expect=rep+2;
+                    if(rlen<=0 || rlen>ACL_MAX_REPORT){ dropped++; continue; }
+                    if(!injectable(report[0])){ dropped++; continue; }
+                    if(is_assert){
+                        /* Identity ASSERT: the app is seeding these exact bytes on
+                         * hidraw right now; record them so the capture thread can
+                         * match its on-air copy and learn handle->bdaddr (restart
+                         * fix). Never injected — that is what keeps the readiness
+                         * flip from putting the frame on air twice. */
+                        if(rlen<=ASSERT_MAX){
+                            pthread_mutex_lock(&g_lock);
+                            g_assert[g_assert_next].ts=now_ms();
+                            memcpy(g_assert[g_assert_next].addr,expect,6);
+                            g_assert[g_assert_next].len=(uint16_t)rlen;
+                            memcpy(g_assert[g_assert_next].buf,report,(size_t)rlen);
+                            g_assert_next=(g_assert_next+1)%ASSERT_RING;
+                            pthread_mutex_unlock(&g_lock);
+                        }
+                        continue;
+                    }
                     pthread_mutex_lock(&g_lock);
                     L=link_by_addr(expect);
-                    if(!L && rlen>0 && rlen<=ASSERT_MAX && injectable(report[0])){
-                        /* No link for this pad yet: keep the datagram as an
-                         * identity ASSERT the capture thread matches against the
-                         * on-air hidraw seeding of the same bytes (restart fix). */
-                        g_assert[g_assert_next].ts=now_ms();
-                        memcpy(g_assert[g_assert_next].addr,expect,6);
-                        g_assert[g_assert_next].len=(uint16_t)rlen;
-                        memcpy(g_assert[g_assert_next].buf,report,(size_t)rlen);
-                        g_assert_next=(g_assert_next+1)%ASSERT_RING;
-                    }
                     pthread_mutex_unlock(&g_lock);
                     if(!L){ dropped++; continue; }             /* no link for this target (not ready) */
                 } else {
                     report=rep; rlen=(int)n; L=&g_links[0];     /* legacy untagged -> primary link */
+                    if(rlen<=0 || rlen>ACL_MAX_REPORT){ dropped++; continue; }
+                    if(!injectable(report[0])){ dropped++; continue; }  /* only DS5 output reports */
                 }
-                if(rlen<=0 || rlen>ACL_MAX_REPORT){ dropped++; continue; }
-                if(!injectable(report[0])){ dropped++; continue; }  /* only DS5 output reports */
 
                 int idx=(int)(L-g_links);
                 process_report(L,rawfd,report,rlen,link_nonce[idx],fdepth,maxq,expect,&injected,&dropped,&paced);

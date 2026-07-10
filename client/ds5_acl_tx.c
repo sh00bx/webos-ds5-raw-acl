@@ -31,15 +31,27 @@
 
 #define ACL_MAX_REPORT 4096
 
-/* Tagged-datagram framing (multi-controller). A datagram that begins with these
- * two magic bytes followed by the 6-byte target address (LSB-first, i.e. HCI
- * byte order, matching the daemon's captured bound_addr) and then the report is
- * routed to that controller's link. The magic's first byte (0xA5) is not a valid
- * DS5 output report id (0x31/0x32/0x36), so the daemon disambiguates a tagged
- * datagram from a legacy untagged one by inspecting byte 0 alone. */
-#define ACL_TAG_M0   0xA5
-#define ACL_TAG_M1   0x5A
-#define ACL_TAG_LEN  8          /* 2 magic + 6 address */
+/* Tagged-datagram framing (multi-controller): [0xA5][kind][addr 6, LSB-first, i.e.
+ * HCI byte order matching the daemon's captured bound_addr][report]. Byte 0 is not
+ * a valid DS5 output report id (0x31/0x32/0x36), so the daemon tells a tagged
+ * datagram from a legacy untagged one by inspecting it alone.
+ *
+ *   ACL_TAG_INJECT — forward the report onto that controller's link. Sent ONLY
+ *                    while the link is ready, i.e. while we are not seeding hidraw.
+ *   ACL_TAG_ASSERT — identity assertion, never injected. Sent alongside the hidraw
+ *                    seed while NOT ready, so the daemon can match the bytes it
+ *                    sees on air and learn which BT address owns that ACL handle
+ *                    (the only way to re-identify a pad that was already connected
+ *                    when the daemon started: no HCI connect event ever arrives).
+ *                    Keeping it un-injectable prevents a double-send across the
+ *                    readiness flip: the daemon may bind the link up to one
+ *                    readiness-poll interval before we notice, and an injectable
+ *                    datagram in that window would go on air on top of our own
+ *                    hidraw write of the same frame. */
+#define ACL_TAG_M0      0xA5
+#define ACL_TAG_INJECT  0x5A
+#define ACL_TAG_ASSERT  0x5B
+#define ACL_TAG_LEN     8       /* 2 magic/kind + 6 address */
 
 struct ds5_acl_tx {
     ds5_acl_log_fn log_fn;      /* routes milestones to the controller file log */
@@ -49,7 +61,7 @@ struct ds5_acl_tx {
     char      tmpl_path[256];   /* readiness/template file the daemon publishes */
 
     int       tagged;           /* 1 = prepend the target-address tag on every send */
-    uint8_t   tag[ACL_TAG_LEN]; /* [M0][M1][addr LSB-first] prebuilt once */
+    uint8_t   tag[ACL_TAG_LEN]; /* [M0][kind][addr LSB-first]; kind stamped per send */
 
     pthread_t poll_thread;
     int       poll_started;
@@ -141,7 +153,7 @@ ds5_acl_tx_t *ds5_acl_tx_start(int hci_dev, const char *bt_mac,
     uint8_t addr[6]; char machex[13];
     t->tagged = parse_bt_mac(bt_mac, addr, machex);
     if (t->tagged) {
-        t->tag[0] = ACL_TAG_M0; t->tag[1] = ACL_TAG_M1;
+        t->tag[0] = ACL_TAG_M0;         /* tag[1] = kind, stamped per send */
         memcpy(t->tag + 2, addr, 6);
     }
 
@@ -180,8 +192,9 @@ ds5_acl_tx_t *ds5_acl_tx_start(int hci_dev, const char *bt_mac,
 /* Send one tagged datagram [tag][report]; iovec avoids copying the report body. A
  * datagram is delivered atomically, so the daemon always sees tag+report together
  * (never a torn frame). Returns the raw sendmsg() result. */
-static ssize_t send_tagged(ds5_acl_tx_t *t, const uint8_t *report, size_t len)
+static ssize_t send_tagged(ds5_acl_tx_t *t, uint8_t kind, const uint8_t *report, size_t len)
 {
+    t->tag[1] = kind;
     struct iovec iov[2] = {
         { .iov_base = t->tag,           .iov_len = ACL_TAG_LEN },
         { .iov_base = (void *)report,   .iov_len = len },
@@ -205,13 +218,13 @@ int ds5_acl_tx_send(ds5_acl_tx_t *t, const uint8_t *report, size_t len)
          * on-air capture of the very hidraw write we trigger — and flips
          * readiness once the pad's link is bound. Best-effort, non-blocking; NOT
          * an inject (no link exists yet), hidraw stays the sender of record. */
-        if (t->tagged) (void)send_tagged(t, report, len);
+        if (t->tagged) (void)send_tagged(t, ACL_TAG_ASSERT, report, len);
         return DS5_ACL_TX_HIDRAW;
     }
 
     ssize_t wr;
     if (t->tagged) {
-        wr = send_tagged(t, report, len);
+        wr = send_tagged(t, ACL_TAG_INJECT, report, len);
         if (wr == (ssize_t)(ACL_TAG_LEN + len)) { t->injected++; return DS5_ACL_TX_SENT; }
     } else {
         wr = sendto(t->unixfd, report, len, 0,
