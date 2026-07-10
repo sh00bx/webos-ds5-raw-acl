@@ -130,6 +130,9 @@
 #define MAX_LINKS           2
 
 #define IDLE_INVALIDATE_MS  1500   /* drop a link's template after this much DS5 silence */
+#define IDLE_SCAN_MS        250    /* min gap between full g_htab sweeps for an idle pad's
+                                    * handle (sniff-pin); cached handle is revalidated O(1)
+                                    * on every wakeup in between */
 #define DRAIN_CAP           1024   /* max reports drained per poll wakeup (anti-flood) */
 #define JAIL_UID            6261   /* aurora jail uid — only sender allowed to inject */
 #define DS5_VID             0x054c /* Sony      } primary device; the broker additionally */
@@ -496,8 +499,13 @@ static void link_bind(struct ds5_link *L, const uint8_t hdr8[8], uint16_t hh){
  * lost) keeps the stall condition true, so the window would reset every time it
  * refills (~130ms at audio rate) — i.e. unbounded injection into the controller
  * TX queue for the whole blackout, exactly the input-poll starvation the window
- * exists to prevent. Audio-only: a rumble call operates at half occupancy and
- * must never zero the shared accounting.
+ * exists to prevent. Any BLOCKED caller may resync — audio at a full window,
+ * rumble also when pinned at its own rcap: the stale-NOCP condition already
+ * proves the whole LINK's credits stopped (were audio still flowing, its NOCPs
+ * would keep last_nocp fresh), so this never zeroes accounting that is actually
+ * live. Without the rumble trigger a rumble-only session (no 0x36 stream to hit
+ * the window-full path) stayed wedged after a NOCP loss until the 1.5s idle
+ * backstop rebound the link.
  *
  * `expect` (may be NULL) is the target bdaddr the caller ROUTED to (a tagged send).
  * The link is resolved by address, then g_lock is dropped and re-taken here, so a
@@ -523,12 +531,13 @@ static int inject_one(struct ds5_link *L, int rawfd, const uint8_t *rep, int n, 
         if(g_htab[hh].known && memcmp(g_htab[hh].addr,L->bound_addr,6)!=0){
             L->have=0; *reason="bound handle now foreign -> template INVALID"; r=-1;
         } else {
-            if(!is_rumble && L->outstanding>=lim &&
-               L->last_nocp && now_ms()-L->last_nocp>STALL_RESET_MS){
+            int blocked = L->outstanding>=lim || (is_rumble && L->rumble_fly>=rcap);
+            if(blocked && L->last_nocp && now_ms()-L->last_nocp>STALL_RESET_MS){
                 L->outstanding=0; txwin_reset(L);   /* credits presumed lost -> resync */
                 L->last_nocp=now_ms();              /* re-arm: at most one resync per STALL_RESET_MS */
+                blocked=0;
             }
-            if(L->outstanding>=lim || (is_rumble && L->rumble_fly>=rcap)){
+            if(blocked){
                 r=0;
             } else {
                 uint16_t l2=(uint16_t)(1+n), acl=(uint16_t)(4+l2);
@@ -1184,6 +1193,16 @@ static void *capture_thread(void *arg){
     struct timeval tv={.tv_sec=0,.tv_usec=300000}; setsockopt(mfd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
     uint8_t buf[2048];
     uint64_t last_learn=0;
+    /* Idle sniff-pin handle cache (capture-thread-only). The pin needs the ACL
+     * handle currently carrying an idle pad's address, but this loop wakes on
+     * EVERY monitor packet (hundreds/s in-session) — a full g_htab sweep per
+     * wakeup was ~36KB scanned under g_lock each time, all of it discarded by
+     * the >=3s policy-send throttle downstream. Instead the found handle is
+     * cached and revalidated O(1) (still known, address still matches) each
+     * wakeup; the full sweep runs at most every IDLE_SCAN_MS. */
+    uint64_t last_idle_scan=0;
+    uint16_t idle_lh[MAX_LINKS]; uint8_t idle_ok[MAX_LINKS];
+    memset(idle_lh,0,sizeof idle_lh); memset(idle_ok,0,sizeof idle_ok);
     for(;;){
         /* Idle backstop: evaluated EVERY wakeup (not only on recv-timeout) so it
          * still fires while other BT devices keep the monitor socket busy. After a
@@ -1209,11 +1228,21 @@ static void *capture_thread(void *arg){
          * in active mode (battery) for the active pad's haptic latency. Outside
          * a session nothing is pinned: an unused pad may sniff/park freely. */
         if(!none_bound){
+            uint64_t ts=now_ms();
+            int sweep=(ts-last_idle_scan>IDLE_SCAN_MS);
+            if(sweep) last_idle_scan=ts;
             for(int i=0;i<MAX_LINKS;i++){
                 if(pin[i] || !g_links[i].ever_bound) continue;
+                if(idle_ok[i] && g_htab[idle_lh[i]].known &&
+                   memcmp(g_htab[idle_lh[i]].addr,g_links[i].bound_addr,6)==0){
+                    pin[i]=1; lh[i]=idle_lh[i]; continue;   /* cached handle still valid */
+                }
+                idle_ok[i]=0;                    /* stale (DISCONN/reassign/slot reuse) */
+                if(!sweep) continue;             /* next sweep <=IDLE_SCAN_MS away — far
+                                                  * inside the 3s policy-send throttle */
                 for(int h=0;h<4096;h++)
                     if(g_htab[h].known && memcmp(g_htab[h].addr,g_links[i].bound_addr,6)==0){
-                        pin[i]=1; lh[i]=(uint16_t)h; break;
+                        pin[i]=1; lh[i]=(uint16_t)h; idle_lh[i]=(uint16_t)h; idle_ok[i]=1; break;
                     }
             }
         }
