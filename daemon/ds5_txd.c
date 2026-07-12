@@ -1091,14 +1091,19 @@ static void handle_hci_event(const uint8_t *e, int el){
                 uint16_t arg=g_pend[i].arg;
                 g_pend_n--;
                 memmove(&g_pend[i],&g_pend[i+1],(size_t)(g_pend_n-i)*sizeof g_pend[0]);
-                /* Exit_Sniff answered with an ERROR status (0x0c disallowed)
-                 * proves the link is NOT sniffed — the tracked mode was stale
-                 * (Mode Change or kernel connect lost on the monitor). Repair
-                 * it authoritatively, or the pin loop would re-send Exit_Sniff
+                /* Exit_Sniff answered with 0x0c (Command Disallowed) proves the
+                 * link is NOT sniffed — the tracked mode was stale (Mode Change
+                 * or kernel connect lost on the monitor). Repair it
+                 * authoritatively, or the pin loop would re-send Exit_Sniff
                  * every 3s forever: an active link never emits the Mode Change
                  * that would clear mode, and the futile loop eats ~2/3 of the
-                 * 0.5/s kernel command drain for the rest of the session. */
-                if(op==OP_EXIT_SNIFF && p[0]!=0x00){
+                 * 0.5/s kernel command drain for the rest of the session.
+                 * ONLY 0x0c: any other error (controller busy, unspecified) on a
+                 * genuinely sniffed link would wrongly clear mode, and with no
+                 * further Mode Change event Exit_Sniff would never be retried —
+                 * the inverse bug. Unknown errors leave mode untouched; the 3s
+                 * throttle bounds the retry cost. */
+                if(op==OP_EXIT_SNIFF && p[0]==0x0c){
                     pthread_mutex_lock(&g_lock);
                     g_htab[arg&0x0fff].mode=0;
                     pthread_mutex_unlock(&g_lock);
