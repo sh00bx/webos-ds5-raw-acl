@@ -88,6 +88,7 @@ reassert_workers() {
   done
 }
 
+echo 10 > /tmp/ds5_inject_fifo 2>/dev/null  # boot-persist: elastic audio FIFO (storm ride-through; 150ms age-out + host rate servo bound the added latency)
 while true; do
   # Rotate (never truncate) at spawn so a crashed instance's log survives one
   # respawn generation — the old O_TRUNC redirect wiped the crash evidence ~1s

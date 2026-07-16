@@ -1616,6 +1616,7 @@ int main(int argc,char**argv){
     int minfo=open_mount_watch();   /* self-heal ds5_acl.sock across jail-tmp remounts */
     uint8_t rep[ACL_TAG_LEN+ACL_MAX_REPORT];   /* tag (optional) + report; inject framing in inject_one() */
     long injected=0, dropped=0, paced=0; uint64_t last_log=now_ms();
+    uint64_t last_stat=now_ms(); uint32_t stat_seq=0;   /* queue-telemetry publish (v9) */
     for(;;){
         struct pollfd pfd[2]={{ufd,POLLIN,0},{minfo,POLLPRI,0}};
         int to=(ufd<0 || minfo<0)?500:-1;
@@ -1769,6 +1770,50 @@ int main(int argc,char**argv){
                 injected,dropped,paced,inject_maxq(),inject_fifo(),g_scan_ctr,g_pend_n,
                 g_cmd_dead?" CMDDEAD":"", links);
             last_log=now_ms();
+        }
+        /* Queue-telemetry publish (v9): every ~200ms of TRAFFIC (this loop only
+         * wakes on datagrams, which is exactly when the queue can move) write a
+         * small per-address stats record "<tmpl>.<mac>.st" the jailed app reads
+         * and forwards to the host as CTMB pace feedback — the host's rate
+         * servo needs to SEE the backlog (fifo>0 = frames parked behind a full
+         * credit window) to shed it. Plain overwrite, no rename: the seq field
+         * plus magic lets the reader ignore a torn read; a stale file after
+         * unbind stops advancing seq, which the app treats as "nothing new". */
+        if(now_ms()-last_stat>200){
+            last_stat=now_ms();
+            struct { int eb; uint8_t valid,q,fifo; uint8_t addr[6]; } st[MAX_LINKS];
+            pthread_mutex_lock(&g_lock);
+            for(int i=0;i<MAX_LINKS;i++){
+                struct ds5_link *L=&g_links[i];
+                st[i].eb=L->ever_bound; st[i].valid=L->have?1:0;
+                int q=L->outstanding; if(q<0)q=0; if(q>255)q=255;
+                st[i].q=(uint8_t)q;
+                int fc=L->fifo_count; if(fc<0)fc=0; if(fc>255)fc=255;
+                st[i].fifo=(uint8_t)fc;
+                memcpy(st[i].addr,L->bound_addr,6);
+            }
+            pthread_mutex_unlock(&g_lock);
+            stat_seq++;
+            int mq=inject_maxq(), fc_cap=inject_fifo();
+            for(int i=0;i<MAX_LINKS;i++){
+                if(!st[i].eb || !st[i].valid) continue;   /* publish only live links */
+                uint8_t rec[24];
+                rec[0]='D';rec[1]='S';rec[2]='5';rec[3]='Q';
+                rec[4]=1; rec[5]=st[i].valid; rec[6]=st[i].q; rec[7]=st[i].fifo;
+                rec[8]=(uint8_t)(mq&0xff); rec[9]=(uint8_t)((mq>>8)&0xff);
+                rec[10]=(uint8_t)(fc_cap&0xff); rec[11]=(uint8_t)((fc_cap>>8)&0xff);
+                uint32_t v=(uint32_t)injected;
+                rec[12]=v&0xff; rec[13]=(v>>8)&0xff; rec[14]=(v>>16)&0xff; rec[15]=(v>>24)&0xff;
+                v=(uint32_t)dropped;
+                rec[16]=v&0xff; rec[17]=(v>>8)&0xff; rec[18]=(v>>16)&0xff; rec[19]=(v>>24)&0xff;
+                v=stat_seq;
+                rec[20]=v&0xff; rec[21]=(v>>8)&0xff; rec[22]=(v>>16)&0xff; rec[23]=(v>>24)&0xff;
+                char p[600], p2[620];
+                per_addr_path(p,sizeof p,st[i].addr);
+                snprintf(p2,sizeof p2,"%s.st",p);
+                int fd=open(p2,O_WRONLY|O_CREAT|O_TRUNC,0644);
+                if(fd>=0){ ssize_t w=write(fd,rec,24); (void)w; fchmod(fd,0644); close(fd); }
+            }
         }
     }
     return 0;
